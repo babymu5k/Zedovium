@@ -1,0 +1,2 @@
+# Zedovium
+A new crypto
