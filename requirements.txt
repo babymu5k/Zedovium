@@ -1,0 +1,5 @@
+requests
+sanic
+sanic-ext
+ecdsa
+protobuf
