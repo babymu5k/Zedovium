@@ -1,0 +1,20 @@
+{
+    "files.exclude": {
+        "**/.git": true,
+        "**/.svn": true,
+        "**/.hg": true,
+        "**/.DS_Store": true,
+        "**/Thumbs.db": true,
+        "**/CVS": true,
+        ".python-version": true,
+        "uv.lock": true,
+        "pyproject.toml": true,
+        ".vscode": true
+    },
+    "hide-files.files": [
+        ".python-version",
+        "uv.lock",
+        "pyproject.toml",
+        ".vscode"
+    ]
+}

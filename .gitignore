@@ -1,3 +1,5 @@
 env
 src/__pycache__
 src/data/blockchain.json
+.venv
+.zed_history

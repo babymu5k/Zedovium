@@ -2,4 +2,9 @@ requests
 sanic
 sanic-ext
 ecdsa
-protobuf
+termcolor
+web3
+jinja2
+sanic_jinja2
+prompt_toolkit
+openapi3_blueprint
