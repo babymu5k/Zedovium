@@ -3,3 +3,6 @@ src/__pycache__
 src/data/blockchain.json
 .venv
 .zed_history
+.vscode
+test.py
+src/data/config.json

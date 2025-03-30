@@ -15,19 +15,20 @@
 """
 
 
-import json as jsonify
+import hashlib
+import ujson as jsonify
+import os
+import secrets
 import time
-from sanic import Sanic
-from sanic.response import text, json
-import requests, os
-from termcolor import colored
-from jinja2 import FileSystemLoader
-import sanic_jinja2
 
-import hashlib, secrets
-import time
-from web3 import Web3
+import requests
+import sanic_jinja2
+from jinja2 import FileSystemLoader
+from sanic import Sanic
+from sanic.response import json, text
 from sanic_ext import openapi
+from termcolor import colored
+from web3 import Web3
 
 with open("src/data/words.txt") as f:
     WORDLIST = [line.strip() for line in f]
@@ -76,10 +77,6 @@ class Mempool:
             if tx['txid'] not in txids
         ]
 
-class BlockChain:
-    def __init__(self):
-        self.mempool = Mempool()
-        # ... rest of init ...
 
 class AddressGen:
     @staticmethod
@@ -215,11 +212,18 @@ class BlockChain:
         return sum(list(self.balances.values()))
             
     def SaveDB(self):
-        with open("src/data/blockchain.json", "w") as f:
-            Tosave = [block.to_dict() for block in self.chain]
-            jsonify.dump(Tosave, f)
-            #print(Tosave)
-            f.close()
+        """Only save when chain has changed"""
+        if not self.save_flag:
+            return
+            
+        # Use atomic write to prevent corruption
+        temp_path = "src/data/blockchain.json.tmp"
+        with open(temp_path, "w") as f:
+            jsonify.dump([block.to_dict() for block in self.chain], f)
+        
+        # Atomic rename (works on Unix/Windows)
+        os.replace(temp_path, "src/data/blockchain.json")
+        #print(colored("Blockchain Database SAVED!", "green"))
             
     def LoadDB(self):
         self.save_flag = False
@@ -445,13 +449,13 @@ class BlockChain:
 
 app = Sanic(__name__)
 app.config.KEEP_ALIVE_TIMEOUT = 3600
-
 blockchain = BlockChain()
 blockchain.save_flag = True
 
 
 ####################### NODE ################################
 @app.get("/ping")
+@openapi.description("Ping the server")
 async def pong(request):
     return json(
         {
@@ -461,6 +465,7 @@ async def pong(request):
 
 ####################### NETWORK #############################
 @app.get("/network/info")
+@openapi.description("Get network information")
 async def get_network_info(request):
     return json({
         "height": len(blockchain.chain) - 1,
@@ -479,16 +484,19 @@ async def get_chain(request):
                        "chain": chain_data}, )
 
 @app.get("/network/latestblock")
+@openapi.description("Get the latest block")
 async def get_block(request):
     return json(vars(blockchain.latest_block))
 
 @app.get("/network/totalsupply")
+@openapi.description("Get the total supply of the blockchain")
 async def get_totalsupply(request):
     return json({
         "TotalSupply": blockchain.GetSupply()
     })
     
 @app.get("/network/getblockbyhash/<hash>")
+@openapi.description("Get block by hash")
 def get_block_by_hash(request, hash):
     block = blockchain.block_by_hash(hash)
     print(block)
@@ -500,6 +508,7 @@ def get_block_by_hash(request, hash):
         return json(vars(block))
 
 @app.get("/network/block/<blocknum>")
+@openapi.description("Get block by number")
 def get_block_by_num(request, blocknum : int):
     blockc = blockchain.chain
     if len(blockc) < blocknum:
@@ -510,6 +519,7 @@ def get_block_by_num(request, blocknum : int):
     return json(vars(blockc[blocknum]))
     
 @app.get("/network/blocks")
+@openapi.description("Get blocks using ?count=<number>")
 async def get_recent_blocks(request):
     count = int(request.args.get("count", 5))
     count = min(count, len(blockchain.chain))
@@ -528,6 +538,7 @@ async def get_recent_blocks(request):
     return json({"blocks": blocks[::-1]})  # Return newest first
 
 @app.get("/network/transactions")
+@openapi.description("Get transactions using ?count=<number>")
 async def get_recent_transactions(request):
     count = int(request.args.get("count", 5))
     all_txs = []
@@ -548,6 +559,7 @@ async def get_recent_transactions(request):
 ####################### Mining ###################################
 
 @app.get("/mining/info")
+@openapi.description("Get mining information")
 async def get_mining_info(request):
     return json ({
         "difficulty": blockchain.diff,
@@ -555,6 +567,7 @@ async def get_mining_info(request):
         })
     
 @app.post("/mining/submitblock")
+@openapi.description("Submit a mined block")
 async def submit_block(request):
     block_data = request.json
     index = block_data["index"]
@@ -585,6 +598,7 @@ async def submit_block(request):
 
 ####################### USERS ####################################
 @app.get("/user/balance/<address>")
+@openapi.description("Get user balance")
 async def get_balance(request, address):
     balance = blockchain.get_balance(address)
     return json({
@@ -596,6 +610,7 @@ async def get_balance(request, address):
 ######################### Wallet API #################################
 
 @app.get("/wallet/create")
+@openapi.description("Create a new wallet")
 async def CreateWallet(request):
     wallet = AddressGen.generate()
 
@@ -606,6 +621,7 @@ async def CreateWallet(request):
     })
 
 @app.post("/wallet/import")
+@openapi.description("Import an existing wallet")
 # import an existing seed
 async def ImportWallet(request):
     seed = request.json.get("seed", None)
@@ -617,6 +633,7 @@ async def ImportWallet(request):
     })
 
 @app.get("/wallet/validate/<address>")
+@openapi.description("Validate an address")
 async def validate_address(request, address):
     return json({
         "address": address,
@@ -624,6 +641,7 @@ async def validate_address(request, address):
     })
 
 @app.post("/transaction/create")
+@openapi.description("Create a new transaction and submit to mempool")
 async def create_transaction(request):
     data = request.json
     sender = data.get('sender')
@@ -646,6 +664,7 @@ async def create_transaction(request):
 
 ############################## Mempool API #################################
 @app.get("/mempool/info")
+@openapi.description("Get mempool information")
 async def mempool_info(request):
     return json({
         "count": len(blockchain.mempool.transactions),
@@ -657,6 +676,7 @@ async def mempool_info(request):
     })
 
 @app.get("/mempool/transactions")
+@openapi.description("Get transactions in mempool")
 async def mempool_transactions(request):
     count = min(int(request.args.get("count", 100)), 1000)
     return json({
@@ -908,6 +928,17 @@ async def serve_openapi_spec(request):
         spec = jsonify.load(f)
     return json(spec)
 
+def greeter():
+    if os.path.exists("src/data/config.json"):
+        data = jsonify.load(open("src/data/config.json", "r"))
+        address = AddressGen.validate(data["address"])
+        if address:
+            print(colored(f"Welcome back {data['address']}!", "green"))
+        else:
+            print(colored("Invalid address in config.json :( ignoring", "red"))
+    else:
+        pass
 
 if __name__ == "__main__":
+    greeter()
     app.run(debug=True, port=4024, single_process=True)

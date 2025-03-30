@@ -2,7 +2,7 @@
 import cmd
 import sys
 import json, hashlib
-import getpass
+import getpass, os, time
 import requests
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
@@ -27,7 +27,7 @@ class ZEDWalletCLI(cmd.Cmd):
         self.commands = [
             'new', 'load', 'balance', 'send', 'exit', 
             'help', 'info', 'address', 'connect',
-            'blocks', 'transactions'
+            'blocks', 'transactions', 'blocktime'
         ]
         self.completer = WordCompleter(self.commands)
         
@@ -43,6 +43,7 @@ class ZEDWalletCLI(cmd.Cmd):
               """)
         print(f"Connected to node: {self.NODE_URL}")
         print("Type 'help' for available commands\n")
+        self.do_load()
 
     def cmdloop(self, intro=None):
         while True:
@@ -77,36 +78,48 @@ class ZEDWalletCLI(cmd.Cmd):
                 print(f"Seed: {wallet['seed']}")
                 print("\nIMPORTANT: Save this seed phrase securely!")
                 print("If you lose it, you will lose access to your funds.\n")
+                # Save wallet details to a JSON file
+                wallet_data = {
+                    "address": wallet['address'],
+                    "seed": wallet['seed']
+                }
+                with open("src/data/config.json", "w") as wallet_file:
+                    json.dump(wallet_data, wallet_file, indent=4)
+                print("Wallet details saved to 'src/data/config.json'")
             else:
                 print(f"\nError creating wallet: {response.text}\n")
         except requests.exceptions.RequestException as e:
             print(f"\nConnection error: {e}\n")
 
-    def do_load(self, arg):
+    def do_load(self):
         """Load an existing wallet: load [seed]"""
-        if not arg:
-            seed = getpass.getpass("Enter seed phrase: ")
-        else:
-            seed = arg.strip()
         
-        try:
-            response = requests.post(
-                f"{self.NODE_URL}/wallet/import",
-                json={"seed": seed}
-            )
+        if not os.path.exists("src/data/config.json"):
+            print("No wallet found. Create a new wallet first.")
+            return
+        
+        with open("src/data/config.json", "r") as wallet_file:
+            try:
+                wallet_data = json.load(wallet_file)
+            except json.JSONDecodeError:
+                print("Error reading wallet file. Please check the file.")
+                return
+        if 'address' not in wallet_data or 'seed' not in wallet_data:
+            print("Invalid wallet data. Please create a new wallet.")
+        else:   
+            self.current_wallet = wallet_data
+            print("\n=== Wallet Loaded ===")
+            print(f"Address: {wallet_data['address']}")
             
-            if response.status_code == 200:
-                wallet = response.json()
-                self.current_wallet = wallet
-                balance = self._get_balance(wallet['address'])
-                print("\n=== Wallet Loaded ===")
-                print(f"Address: {wallet['address']}")
-                print(f"Balance: {balance} ZED\n")
-            else:
-                print(f"\nError loading wallet: {response.text}\n")
-        except requests.exceptions.RequestException as e:
-            print(f"\nConnection error: {e}\n")
-
+            try:
+                balance = self._get_balance(wallet_data['address'])
+            except requests.exceptions.RequestException as e:
+                print(f"\nConnection error: {e}\n")
+                return
+            
+            print(f"Balance: {balance} ZED\n")
+            
+            
     def _get_balance(self, address):
         """Helper method to get balance"""
         try:
@@ -173,7 +186,7 @@ class ZEDWalletCLI(cmd.Cmd):
             if response.status_code == 200:
                 result = response.json()
                 if result.get('status'):
-                    print(f"\nTransaction successful! TXID: {result.get('txid', 'N/A')}\n")
+                    print(f"\nTransaction successful! TXID: {result.get('txid', 'N/A')} it should confirm soon!\n")
                 else:
                     print(f"\nTransaction failed: {result.get('error', 'Unknown error')}\n")
             else:
@@ -267,6 +280,25 @@ class ZEDWalletCLI(cmd.Cmd):
         """Exit the CLI: exit"""
         print("\nGoodbye!\n")
         sys.exit(0)
+        
+    def do_blocktime(self, arg):
+        """Show time since last block: blocktime"""
+        latestblock = requests.get(f"{self.NODE_URL}/network/latestblock").json()["timestamp"]
+        timenow = time.time()
+        elapsed = timenow - latestblock
+        elapsed_pretty = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+        if elapsed <= 30:
+            print("\nLast block was found just now.\n")
+        elif elapsed < 240:
+            print(f"\nLast block was found {int(elapsed)} seconds ago.\n")
+        elif elapsed < 3600:
+            minutes = int(elapsed // 60)
+            if minutes == 1:
+                print(f"\nLast block was found {minutes} minute ago.\n")
+            else:
+                print(f"\nLast block was found {minutes} minutes ago.\n")
+        else:
+            print(f"\nLast block was found {elapsed_pretty} ago.\n")
 
     def emptyline(self):
         pass

@@ -9,12 +9,18 @@
         ".python-version": true,
         "uv.lock": true,
         "pyproject.toml": true,
-        ".vscode": true
+        ".vscode": true,
+        "LICENSE": true,
+        ".zed_history": true,
+        "logo.jpg": true
     },
     "hide-files.files": [
         ".python-version",
         "uv.lock",
         "pyproject.toml",
-        ".vscode"
+        ".vscode",
+        "LICENSE",
+        ".zed_history",
+        "logo.jpg"
     ]
 }

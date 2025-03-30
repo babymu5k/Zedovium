@@ -57,7 +57,7 @@ def mine():
         "index": latest_block["index"] + 1,
         "proofN": proof,
         "prev_hash": calculate_hash(latest_block),
-        "miner_address": "ZED-alien-ladybug-glow-garden-cecd",  # Add transactions if any
+        "miner_address": "ZED-pearl-violin-stellar-brave-5b2e",  # Add transactions if any
         "timestamp": time.time()
         }
 
