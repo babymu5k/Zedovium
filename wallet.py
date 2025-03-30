@@ -2,18 +2,19 @@
 import cmd
 import sys
 import json, hashlib
-import getpass, os, time
+import os, time, random, datetime
 import requests
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import WordCompleter
+from termcolor import colored
 
 class ZEDWalletCLI(cmd.Cmd):
     """Command-line wallet interface for ZED cryptocurrency"""
     
     prompt = ">>> "
-    NODE_URL = "http://localhost:4024"
+
     
     def __init__(self):
         super().__init__()
@@ -27,9 +28,11 @@ class ZEDWalletCLI(cmd.Cmd):
         self.commands = [
             'new', 'load', 'balance', 'send', 'exit', 
             'help', 'info', 'address', 'connect',
-            'blocks', 'transactions', 'blocktime'
+            'blocks', 'transactions', 'blocktime',
+            'unconfirmed'
         ]
         self.completer = WordCompleter(self.commands)
+        self.NODE_URL = self.getnode()
         
         print("\nZED Cryptocurrency Wallet - Command Line Interface")
         print("""
@@ -41,7 +44,7 @@ class ZEDWalletCLI(cmd.Cmd):
  #      #      #    # #    #  #  #  # #    # #    # 
 ####### ###### #####   ####    ##   #  ####  #    # v0.1.0                                         
               """)
-        print(f"Connected to node: {self.NODE_URL}")
+        print(colored(f"Connected to node: {self.NODE_URL}", "blue"))
         print("Type 'help' for available commands\n")
         self.do_load()
 
@@ -61,11 +64,17 @@ class ZEDWalletCLI(cmd.Cmd):
     def do_connect(self, arg):
         """Connect to a different node: connect [url]"""
         if arg:
-            self.NODE_URL = arg.rstrip('/')
-            print(f"\nConnected to node: {self.NODE_URL}\n")
-        else:
-            print(f"\nCurrently connected to: {self.NODE_URL}\n")
+            try:
+                requests.get(f"{arg}/ping").status_code == 200
+                self.NODE_URL = arg.rstrip('/')
+                print(colored(f"\nConnected to node: {self.NODE_URL}\n", "green"))
 
+            except requests.exceptions.RequestException:
+                print(colored(f"\nFailed to connect to node: {arg}\nRemaining on: {self.NODE_URL}\n", "red"))
+        
+        else:
+            print(colored(f"\nCurrently connected to: {self.NODE_URL}\n", "blue"))
+        
     def do_new(self, arg):
         """Create a new wallet: new"""
         try:
@@ -127,8 +136,8 @@ class ZEDWalletCLI(cmd.Cmd):
             if response.status_code == 200:
                 return response.json().get('Balance', 0)
             return 0
-        except requests.exceptions.RequestException:
-            return 0
+        except requests.exceptions.RequestException as e:
+            return e
 
     def do_balance(self, arg):
         """Check wallet balance: balance"""
@@ -210,12 +219,14 @@ class ZEDWalletCLI(cmd.Cmd):
         try:
             response = requests.get(f"{self.NODE_URL}/network/info")
             if response.status_code == 200:
+                nethashrate = requests.get(f"{self.NODE_URL}/network/hashrate").json()["hashrate_human"]
                 data = response.json()
                 print("\n=== Blockchain Info ===")
                 print(f"Current height: {data.get('height', 'N/A')}")
                 print(f"Total supply: {data.get('total_supply', 'N/A')} ZED")
                 print(f"Current difficulty: {data.get('difficulty', 'N/A')}")
                 print(f"Block reward: {data.get('block_reward', 'N/A')} ZED")
+                print(f"Network Hashrate: {nethashrate}")
                 print(f"Connected nodes: {data.get('node_count', 'N/A')}\n")
             else:
                 print(f"\nError getting info: {response.text}\n")
@@ -249,23 +260,30 @@ class ZEDWalletCLI(cmd.Cmd):
             print(f"\nConnection error: {e}\n")
 
     def do_transactions(self, arg):
-        """Show recent transactions: transactions [count]"""
+        """Show recent transactions regarding this address: transactions [count]"""
+        count = int(arg) if arg else 3
         try:
-            count = int(arg) if arg else 5
-            response = requests.get(f"{self.NODE_URL}/network/transactions?count={count}")
+            response = requests.get(f"{self.NODE_URL}/network/transactions/{self.current_wallet['address']}")
             
             if response.status_code == 200:
                 transactions = response.json().get('transactions', [])
-                print(f"\nLast {len(transactions)} transactions:")
+                print(f"\nLast {len(transactions[-count:])} transactions:")
                 print("-" * 80)
                 
-                for tx in transactions:
+                for tx in transactions[-count:]:
                     print(f"TXID: {tx.get('txid', 'N/A')}")
                     print(f"Block: {tx.get('block_height', 'N/A')}")
-                    print(f"From: {tx.get('sender', 'N/A')}")
-                    print(f"To: {tx.get('recipient', 'N/A')}")
+                    if tx.get('sender') == self.current_wallet["address"]:
+                        print(colored(f"From: {tx.get('sender', 'N/A')} (you)", "blue"))
+                    else:
+                        print(f"From: {tx.get('sender', 'N/A')}")
+                    if tx.get('recipient') == self.current_wallet["address"]:
+                        print(colored(f"To: {tx.get('recipient', 'N/A')} (you)", "blue"))
+                    else:
+                        print(f"To: {tx.get('recipient', 'N/A')}")
                     print(f"Amount: {tx.get('quantity', 'N/A')} ZED")
-                    print(f"Timestamp: {tx.get('timestamp', 'N/A')}")
+                    #print(f"Timestamp: {tx.get('timestamp', 'N/A')}")
+                    print(f"Timestamp: {datetime.datetime.fromtimestamp(tx.get('timestamp', 'N/A')):%Y-%m-%d %H:%M:%S} ({tx.get('timestamp', 'N/A')})")
                     print("-" * 80)
                     
                 print()
@@ -300,6 +318,20 @@ class ZEDWalletCLI(cmd.Cmd):
         else:
             print(f"\nLast block was found {elapsed_pretty} ago.\n")
 
+    def do_unconfirmed(self, arg):
+        """Show unconfirmed transactions: unconfirmed"""
+        mempool = requests.get(f"{self.NODE_URL}/mempool/transactions").json()
+        print(colored(f"\nUnconfirmed transaction:", "blue"))
+        print("-" * 80)
+        for transaction in mempool["transactions"]:
+            if transaction["sender"] == self.current_wallet["address"] or transaction["recipient"] == self.current_wallet["address"]:
+                print(f"TXID: {transaction['txid']}")
+                print(f"From: {transaction['sender']}")
+                print(f"To: {transaction['recipient']}")
+                print(f"Amount: {transaction['quantity']} ZED")
+                print(f"Timestamp: {datetime.datetime.fromtimestamp(transaction['timestamp']):%Y-%m-%d %H:%M:%S} ({transaction['timestamp']})")
+                print("-" * 80)
+    
     def emptyline(self):
         pass
 
@@ -323,6 +355,9 @@ class ZEDWalletCLI(cmd.Cmd):
         expected_checksum = hashlib.sha256(phrase.encode()).hexdigest()[:4]
         return checksum == expected_checksum
 
+    def getnode(self):
+        response = requests.get("https://raw.githubusercontent.com/babymu5k/Zedovium/refs/heads/develop/nodelist.json").json()
+        return random.choice(response["nodes"])
 
 if __name__ == "__main__":
     wallet = ZEDWalletCLI()

@@ -1,13 +1,21 @@
 import hashlib
 import time
 import requests
+import random
+#from termcolor import colored
+
+def getnode():
+    response = requests.get("https://raw.githubusercontent.com/babymu5k/Zedovium/refs/heads/develop/nodelist.json").json()
+    return random.choice(response["nodes"])
+
+nodelist = getnode()
 
 def get_mining():
-    response = requests.get("http://localhost:4024/mining/info")
+    response = requests.get(f"{nodelist}/mining/info")
     return response.json()
 
 def submit_block(block):
-    response = requests.post("http://localhost:4024/mining/submitblock", json=block)
+    response = requests.post(f"{nodelist}/mining/submitblock", json=block)
     return response.json()
 
 def proof_of_work(last_proof, difficulty):
@@ -57,7 +65,7 @@ def mine():
         "index": latest_block["index"] + 1,
         "proofN": proof,
         "prev_hash": calculate_hash(latest_block),
-        "miner_address": "ZED-pearl-violin-stellar-brave-5b2e",  # Add transactions if any
+        "miner_address": "ZED-alien-ladybug-glow-garden-cecd",  # Add transactions if any
         "timestamp": time.time()
         }
 
@@ -69,5 +77,6 @@ def mine():
         mining_data = get_mining()
         time.sleep(5)
 
+print(getnode())
 if __name__ == "__main__":
     mine()

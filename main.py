@@ -433,7 +433,16 @@ class BlockChain:
         #     if block.index+1 < len(self.chain):
         #         return self.chain[block.index+1] 
         
-        # return None               
+        # return None
+
+    def format_hashrate(self, hashes_per_sec):
+        # Format the hash rate into human-readable format
+        units = ["H/s", "kH/s", "MH/s", "GH/s", "TH/s", "PH/s"]
+        unit_index = 0
+        while hashes_per_sec >= 1000 and unit_index < len(units)-1:
+            hashes_per_sec /= 1000
+            unit_index += 1
+        return f"{hashes_per_sec:.2f} {units[unit_index]}"
 
     @staticmethod
     def obtain_block_object(block_data):
@@ -507,6 +516,34 @@ def get_block_by_hash(request, hash):
     else:
         return json(vars(block))
 
+@app.get("/network/transactionbyid/<txid>")
+@openapi.description("Get transaction by ID")
+def get_transaction(request, txid):
+    for block in blockchain.chain:
+        for tx in block.transactions:
+            if tx['txid'] == txid:
+                return json({
+                    "block_height": block.index,
+                    "transaction": tx
+                })
+    return json({
+        "ERROR": f"{txid} not found"
+    }, 404)
+
+@app.get("/network/transactions/<address>")
+@openapi.description("Get all transactions for an address")
+async def address_transactions(request, address):
+    txs = []
+    for block in blockchain.chain:
+        for tx in block.transactions:
+            if tx['sender'] == address or tx['recipient'] == address:
+                tx_data = dict(tx)
+                tx_data["block_height"] = block.index
+                tx_data["timestamp"] = block.timestamp
+                txs.append(tx_data)
+    
+    return json({"transactions": txs})
+
 @app.get("/network/block/<blocknum>")
 @openapi.description("Get block by number")
 def get_block_by_num(request, blocknum : int):
@@ -555,6 +592,35 @@ async def get_recent_transactions(request):
             break
             
     return json({"transactions": all_txs})
+
+@app.get("/network/hashrate")
+async def get_network_hashrate(request):
+    # Get current difficulty
+    current_diff = blockchain.diff
+    
+    # Calculate average block time (last 60 blocks)
+    block_count = min(60, len(blockchain.chain))
+    if block_count < 2:
+        return json({"error": "Need at least 2 blocks"}, status=400)
+    
+    oldest_block = blockchain.chain[-block_count]
+    newest_block = blockchain.chain[-1]
+    time_span = newest_block.timestamp - oldest_block.timestamp
+    avg_block_time = time_span / (block_count - 1)
+    
+    # Calculate hashrate (fixed formula)
+    # For leading zero difficulty: hashrate = (2^difficulty_bits) / avg_block_time
+    # For blake2b (256-bit): hashrate = (2^256) / (2^(256-difficulty)) / block_time
+    # Simplified to:
+    hashrate = (2 ** current_diff) / avg_block_time
+    
+    return json({
+        "hashrate": hashrate,
+        "hashrate_human": blockchain.format_hashrate(hashrate),
+        "difficulty": current_diff,
+        "avg_block_time": avg_block_time,
+        "blocks_analyzed": block_count
+    })
 
 ####################### Mining ###################################
 
