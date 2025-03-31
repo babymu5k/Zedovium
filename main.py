@@ -16,13 +16,13 @@
 
 
 import hashlib
-import ujson as jsonify
 import os
 import secrets
 import time
 
 import requests
 import sanic_jinja2
+import ujson as jsonify
 from jinja2 import FileSystemLoader
 from sanic import Sanic
 from sanic.response import json, text
@@ -43,11 +43,28 @@ class MempoolFullError(MempoolError):
 class DuplicateTxError(MempoolError):
     pass
 
+
 class Mempool:
     def __init__(self, max_size=10000, block_tx_limit=512):
         self.transactions = []
         self.max_size = max_size  # Prevent memory overload
         self.block_tx_limit = block_tx_limit
+        # Dynamic Fees
+        self.base_fee = 0.01
+        self.max_fee = 0.05
+        self.fee_step = 0.001
+
+    def get_current_fee_percent(self):
+        """Calculate dynamic fee based on mempool fullness"""
+        mempool_fullness = len(self.transactions) / self.max_size
+        # Linear scaling between base and max fee
+        dynamic_fee = min(
+            self.base_fee + (mempool_fullness * 
+                                   (self.max_fee - self.base_fee)),
+            self.max_fee
+        )
+        # Round to nearest step for cleaner UX
+        return round(dynamic_fee / self.fee_step) * self.fee_step
         
     def add_transaction(self, tx):
         """Add transaction with basic validation"""
@@ -198,6 +215,12 @@ class BlockChain:
         self.zedoguard_window = 5 * 60  # 5 minute window for stats
         self.zedoguard = False # Enable Zedovium Guard
         
+        # Tokens #TODO: Add later
+        self.tokens = {} # Format: {token_id: {"name": str, "symbol": str, "supply": int, "creator": str, "balances": {address: amount}}}
+        
+        # Transactions Fees
+        self.transaction_fees = 0.035  # 3.5% transaction fee
+        self.transaction_fee_address = self.GetConfig()[0]  # Address to receive transaction fees        
         
     def update_miner_stats(self, miner_address):
         """Track how often a miner successfully mines blocks"""
@@ -321,6 +344,13 @@ class BlockChain:
             self.construct_block(proofN=0, prev_hash=0)
 
     def construct_block(self, proofN, prev_hash):
+        transactions = self.mempool.get_block_candidates()
+        total_fees = sum(tx['fee'] for tx in transactions if 'fee' in tx)
+        
+        # Update balances for transaction fees
+        if total_fees > 0:
+            self.balances[self.transaction_fee_address] = self.balances.get(self.transaction_fee_address, 0) + total_fees
+            
         block = Block(
             index=len(self.chain),
             proofN=proofN,
@@ -386,8 +416,12 @@ class BlockChain:
         return status
 
     def new_data(self, sender, recipient, quantity): # Used for appending/updating transactions to blc
+        current_fee_percent = self.mempool.get_current_fee_percent()
+        fee = quantity * current_fee_percent
+        totaltxspend = quantity + fee
+        
         pending_spends = sum(
-            tx['quantity'] for tx in self.mempool.transactions
+            tx['quantity'] * (1 + self.mempool.get_current_fee_percent()) for tx in self.mempool.transactions
             if tx['sender'] == sender
         )
         available_balance = self.get_balance(sender) - pending_spends
@@ -398,16 +432,20 @@ class BlockChain:
         
         # Update balances
         if sender != "node":
-            self.balances[sender] = self.balances.get(sender, 0) - quantity
+            self.balances[sender] = self.balances.get(sender, 0) - totaltxspend
             self.balances[recipient] = self.balances.get(recipient, 0) + quantity
             
         # Create Transaction ID
         txid = self.calculate_txid(time.time(), len(self.chain))
+        if sender == "node":
+            fee = 0
         
         tx = {
             'sender': sender,
             'recipient': recipient,
             'quantity': quantity,
+            'fee': fee, # Add fee to transaction
+            'fee_percent': current_fee_percent,
             'txid': txid,
             'timestamp': time.time(),
         }
@@ -415,7 +453,7 @@ class BlockChain:
         try: 
             self.mempool.add_transaction(tx)
             #print(colored(f"Transaction from {sender} to {recipient} for {quantity} added to mempool.", "green")) #Debug
-            return {"status": True, "txid": txid}
+            return {"status": True, "txid": txid, "fee": fee}
         except MempoolFullError:
             return {"status": False, "txid": None, "error": "Mempool is full"}
 
@@ -535,7 +573,10 @@ class BlockChain:
             block_data['prev_hash'],
             block_data['transactions'],
             timestamp=block_data['timestamp'])
-
+        
+    def GetConfig(self):
+        data = jsonify.load(open("src/data/config.json", "r"))
+        return [data["address"], data["seed"]]
 
 app = Sanic(__name__)
 app.config.KEEP_ALIVE_TIMEOUT = 3600
@@ -706,59 +747,48 @@ async def get_network_hashrate(request):
         "blocks_analyzed": block_count
     })
     
+# @app.get("/network/fee_info")
+# @openapi.description("Get information about transaction fees")
+# async def get_fee_info(request):
+#     return json({
+#         "fee_percentage": blockchain.mempool.get_current_fee_percent(),
+#         "description": f"Fixed {round(blockchain.mempool.get_current_fee_percent()*100, 2)}% fee on all transactions",
+#         "distribution": "Zedovium Development Fund",
+#     })
+
+@app.get("/network/fee_estimate")
+@openapi.description("Get current fee estimate")
+async def get_fee_estimate(request):
+    current_fee = blockchain.mempool.get_current_fee_percent()
+    mempool_status = {
+        "fee": current_fee,
+        "current_fee_percent": current_fee * 100,
+        "mempool_utilization": f"{(len(blockchain.mempool.transactions)/blockchain.mempool.max_size)*100:.1f}%",
+        "next_block_capacity": blockchain.mempool.block_tx_limit,
+        "pending_transactions": len(blockchain.mempool.transactions),
+        "total_fees": sum(tx['fee'] for tx in blockchain.mempool.transactions if 'fee' in tx) # Total fees in mempool
+    }
+    return json(mempool_status)
+
+@app.get("/network/fee_chart")
+@openapi.description("Visualize fee structure")
+async def fee_chart(request):
+    steps = 10
+    data = []
+    for i in range(steps + 1):
+        utilization = i / steps
+        temp_mempool = Mempool()  # Create temp instance for calculation
+        temp_mempool.transactions = [None] * int(utilization * temp_mempool.max_size)
+        fee = temp_mempool.get_current_fee_percent() * 100
+        data.append({
+            "mempool_utilization": f"{utilization*100:.0f}%",
+            "fee_percent": fee
+        })
+    return json({"fee_structure": data})
+
 @app.get("/network/checkaddrdiff/<address>")
 @openapi.description("Check if an address is mining under normal or high difficulty")
 async def check_address_difficulty(request, address):
-
-    # # Check if address is valid first
-    # if not AddressGen.validate(address):
-    #     return json({
-    #         "status": "error",
-    #         "message": "Invalid address format"
-    #     }, status=400)
-        
-    # # Check if address has mining stats
-    # if address not in blockchain.miner_stats and blockchain.zedoguard or not(blockchain.zedoguard):
-    #     return json({
-    #         "status": "normal",
-    #         "message": "(no mining activity detected)",
-    #         "difficulty_multiplier": 1.0,
-    #         "current_blocks_per_hour": 0,
-    #         "threshold": blockchain.zedoguard_threshold
-    #     })
-        
-        
-    # stats = blockchain.miner_stats[address]
-    # current_bph = len(stats['blocks'])  # blocks per hour
-        
-    # if stats['multiplier'] > 1.0:
-    #     status = "high"
-    #     message = f"Address has high difficulty (mining {current_bph} blocks/hour)"
-    # else:
-    #     status = "normal"
-    #     message = f"Address has normal difficulty (mining {current_bph} blocks/hour)"
-    
-    # if blockchain.zedoguard == True:
-    #     return json({
-    #         "status": status,
-    #         "message": message,
-    #         "difficulty_multiplier": stats['multiplier'],
-    #         "current_blocks_per_hour": current_bph,
-    #         "threshold": blockchain.zedoguard_threshold,
-    #         "base_difficulty": blockchain.diff,
-    #         "effective_difficulty": blockchain.get_miner_difficulty(address)
-    #     })
-    # elif blockchain.zedoguard == False:
-    #     return json({
-    #         "status": "normal",
-    #         "message": "Zedovium Guard is disabled. No difficulty checks.",
-    #         "difficulty_multiplier": 0,
-    #         "current_blocks_per_hour": current_bph,
-    #         "threshold": blockchain.zedoguard_threshold,
-    #         "base_difficulty": blockchain.diff,
-    #         "effective_difficulty": blockchain.get_miner_difficulty(address)
-    #     })
-    
     if not AddressGen.validate(address):
         return json({
             "status": "error",
@@ -818,6 +848,8 @@ async def check_address_difficulty(request, address):
             "base_difficulty": blockchain.diff,
             "effective_difficulty": blockchain.get_miner_difficulty(address)
         })
+        
+
 
 ####################### Mining ###################################
 
@@ -927,6 +959,7 @@ async def create_transaction(request):
     return json(success)
 
 
+
 ############################## Mempool API #################################
 @app.get("/mempool/info")
 @openapi.description("Get mempool information")
@@ -947,6 +980,7 @@ async def mempool_transactions(request):
     return json({
         "transactions": blockchain.mempool.transactions[:count]
     })
+    
 
 ############################# Web3 Compat layer #############################
 #for metamask very broken though
