@@ -146,6 +146,7 @@ GNU General Public License v3.0
 ✅ **BLAKE2b** ensures fast & secure hashing  
 ✅ **Full Web3 RPC** support for compatibility  
 
-For more details, check the [OpenAPI spec](#) (if implemented).  
+For more details, check the [OpenAPI spec](#) (if implemented).
+Check out the [Discord](https://discord.gg/zYdeBw7gwB)
 
 🚀 **Happy mining!** 🚀
