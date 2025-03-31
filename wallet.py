@@ -29,11 +29,11 @@ class ZEDWalletCLI(cmd.Cmd):
             'new', 'load', 'balance', 'send', 'exit', 
             'help', 'info', 'address', 'connect',
             'blocks', 'transactions', 'blocktime',
-            'unconfirmed'
+            'unconfirmed', 'zedoguard'
         ]
         self.completer = WordCompleter(self.commands)
         self.NODE_URL = self.getnode()
-        
+        self.clear_screen()
         print("\nZED Cryptocurrency Wallet - Command Line Interface")
         print("""
 #######                                             
@@ -47,6 +47,10 @@ class ZEDWalletCLI(cmd.Cmd):
         print(colored(f"Connected to node: {self.NODE_URL}", "blue"))
         print("Type 'help' for available commands\n")
         self.do_load()
+        
+    def clear_screen(self):
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
 
     def cmdloop(self, intro=None):
         while True:
@@ -140,12 +144,17 @@ class ZEDWalletCLI(cmd.Cmd):
             return e
 
     def do_balance(self, arg):
-        """Check wallet balance: balance"""
+        """Check wallet balance: balance [address]"""
+
         if not self.current_wallet:
-            print("No wallet loaded. Use 'new' or 'load' first.")
-            return
+            if not arg:
+                print("No wallet loaded. Use 'new' or 'load' first.")
+                return
             
-        balance = self._get_balance(self.current_wallet['address'])
+        else:
+            address = arg if arg else self.current_wallet['address']
+            
+        balance = self._get_balance(address)
         print(f"\nBalance: {balance} ZED\n")
 
     def do_send(self, arg):
@@ -227,7 +236,16 @@ class ZEDWalletCLI(cmd.Cmd):
                 print(f"Current difficulty: {data.get('difficulty', 'N/A')}")
                 print(f"Block reward: {data.get('block_reward', 'N/A')} ZED")
                 print(f"Network Hashrate: {nethashrate}")
-                print(f"Connected nodes: {data.get('node_count', 'N/A')}\n")
+                print(f"Connected nodes: {data.get('node_count', 'N/A')}")
+                print(f"ZedoGuard Threshold: {data.get('threshold', 'N/A')} blocks")
+                print(f"ZedoGuard Window: {data.get('window', 'N/A')} seconds")
+                if data.get('zedoguard'):
+                    print(f"ZedoGuard Status: {data.get('zedoguard', 'N/A')}")
+                else:
+                    pass
+                print("-" * 29 + "\n")
+                
+                
             else:
                 print(f"\nError getting info: {response.text}\n")
         except requests.exceptions.RequestException as e:
@@ -331,6 +349,22 @@ class ZEDWalletCLI(cmd.Cmd):
                 print(f"Amount: {transaction['quantity']} ZED")
                 print(f"Timestamp: {datetime.datetime.fromtimestamp(transaction['timestamp']):%Y-%m-%d %H:%M:%S} ({transaction['timestamp']})")
                 print("-" * 80)
+                
+    def do_zedoguard(self, arg):
+        """Check if you miner is going too fast and has been throttled by Zedoguard: zedoguard"""
+        response = requests.get(f"{self.NODE_URL}/network/checkaddrdiff/{self.current_wallet['address']}").json()
+        
+        if response["current_blocks_per_hour"] > response["threshold"] and response["status"] == "high":
+            print(colored(f"\n⚠ WARNING: Your miner is running too fast!\n", "red"))
+            print(colored(f"Current difficulty for your miner: {response['effective_difficulty']}", "yellow"))
+            print(colored(f"{response['message']}\n", "yellow"))
+            
+        elif response["current_blocks_per_hour"] <= response["threshold"] and response["status"] == "normal":
+            print(colored(f"\nYour miner is running at a normal speed.\n", "green"))
+            
+        elif response["current_blocks_per_hour"] == 0:
+            print(colored(f"\nYour miner is not mining at all.\n", "red"))
+            
     
     def emptyline(self):
         pass

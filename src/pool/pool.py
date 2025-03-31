@@ -1,222 +1,229 @@
-# pool_server_fixed.py
-import json
-import time
+# pool_server.py
 import hashlib
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from threading import Thread, Lock
+import time
+import json
+import secrets, requests
+from datetime import datetime
 from collections import defaultdict
-import requests
+from sanic import Sanic, response
+from sanic_ext import openapi
 
-class MiningPool:
-    def __init__(self, node_url, reward_address, fee_percent=1.0):
-        self.node_url = node_url.rstrip('/')
-        self.reward_address = reward_address
-        self.fee_percent = fee_percent
-        self.miners = defaultdict(lambda: {'shares': 0, 'last_active': 0})
-        self.current_work = None
-        self.work_lock = Lock()
-        self.share_difficulty = 8  # Easier than main chain
-        self.block_time_target = 300  # 5 minutes
-        self.last_block_time = time.time()
+# Configuration
+POOL_FEE_PERCENT = 1.0  # 1% pool fee
+PAYOUT_THRESHOLD = 100  # Minimum ZED balance before payout
+BLOCK_REWARD = 80  # From your blockchain constants
+SHARE_DIFFICULTY = 4  # Lower than network difficulty for frequent shares
+
+app = Sanic("ZedoviumPool")
+pool = None
+
+class Pool:
+    def __init__(self):
+        self.miners = {}  # {address: {shares: int, last_share: timestamp, balance: float}}
+        self.blocks = []  # Mined blocks waiting for confirmation
+        self.shares = defaultdict(int)  # Temporary share counting for current round
+        self.current_job = None
+        self.last_block_update = 0
+        self.node_url = "http://localhost:4024"  # Default to local node
         
-        # Start background tasks
-        Thread(target=self.update_work_loop, daemon=True).start()
-        Thread(target=self.cleanup_inactive_miners, daemon=True).start()
-
-    def update_work(self):
-        """Fetch current blockchain state"""
+    def update_job(self):
+        """Get current mining job from blockchain node"""
         try:
-            # Get latest block
-            block = requests.get(f"{self.node_url}/network/latestblock", timeout=5).json()
-            
-            # Get pending transactions
-            mempool = requests.get(f"{self.node_url}/mempool/transactions", timeout=5).json()
-            
-            with self.work_lock:
-                self.current_work = {
-                    'height': block['index'] + 1,
-                    'prev_hash': block['prev_hash'],
-                    'prev_proof': block['proofN'],
-                    'transactions': mempool.get('transactions', [])[:50],  # Limit tx count
-                    'share_target': 2 ** (256 - self.share_difficulty),
+            resp = requests.get(f"{self.node_url}/mining/info")
+            if resp.status_code == 200:
+                data = resp.json()
+                self.current_job = {
+                    'height': data['latestblock']['index'] + 1,
+                    'prev_hash': data['latestblock']['prev_hash'],
+                    'difficulty': data['difficulty'],
                     'timestamp': time.time()
                 }
-            return True
+                self.last_block_update = time.time()
         except Exception as e:
-            print(f"Work update failed: {str(e)}")
+            print(f"Error updating job: {e}")
+
+    def add_share(self, miner_address, nonce, share_difficulty):
+        """Validate and record a share from a miner"""
+        if not self.current_job:
             return False
-
-    def update_work_loop(self):
-        """Periodically update work unit"""
-        while True:
-            self.update_work()
-            time.sleep(30)
-
-    def validate_share(self, miner_id, proof):
-        """Validate miner's share"""
-        with self.work_lock:
-            if not self.current_work:
-                return {'valid': False, 'error': 'No current work'}
             
-            work = self.current_work.copy()
-        
-        # Verify share difficulty
-        guess = f"{work['prev_proof']}{proof}".encode()
-        guess_hash = int(hashlib.blake2b(guess).hexdigest(), 16)
-        
-        if guess_hash >= work['share_target']:
-            return {'valid': False, 'error': 'Low difficulty'}
-        
-        # Verify if it's also a valid block
-        is_block = False
-        try:
-            block_data = {
-                'index': work['height'],
-                'proofN': proof,
-                'prev_hash': work['prev_hash'],
-                'miner_address': self.reward_address,
-                'timestamp': int(time.time())
+        # Validate the share meets the required difficulty
+        if not self.valid_share(nonce, share_difficulty):
+            return False
+            
+        # Initialize miner if new
+        if miner_address not in self.miners:
+            self.miners[miner_address] = {
+                'shares': 0,
+                'last_share': time.time(),
+                'balance': 0.0,
+                'pending_payout': 0.0
             }
-            response = requests.post(
+            
+        # Update miner stats
+        self.miners[miner_address]['shares'] += 1
+        self.miners[miner_address]['last_share'] = time.time()
+        self.shares[miner_address] += 1
+        
+        return True
+        
+    def valid_share(self, nonce, share_difficulty):
+        """Check if a share meets the required difficulty"""
+        if not self.current_job:
+            return False
+            
+        guess = f"{self.current_job['prev_hash']}{nonce}".encode()
+        guess_hash = hashlib.blake2b(guess).hexdigest()
+        return guess_hash.startswith("0" * share_difficulty)
+        
+    def submit_block(self, miner_address, nonce):
+        """Submit a found block to the network"""
+        if not self.current_job:
+            return False
+            
+        # Verify the block meets network difficulty
+        if not self.valid_share(nonce, self.current_job['difficulty']):
+            return False
+            
+        # Prepare block submission
+        block_data = {
+            "index": self.current_job['height'],
+            "proofN": nonce,
+            "prev_hash": self.current_job['prev_hash'],
+            "miner_address": miner_address,
+            "timestamp": time.time()
+        }
+        
+        try:
+            resp = requests.post(
                 f"{self.node_url}/mining/submitblock",
                 json=block_data,
                 timeout=10
             )
-            is_block = response.status_code == 201
-        except Exception as e:
-            print(f"Block submission failed: {str(e)}")
-        
-        # Update miner stats
-        self.miners[miner_id]['shares'] += 1
-        self.miners[miner_id]['last_active'] = time.time()
-        
-        return {
-            'valid': True,
-            'block_found': is_block,
-            'shares': self.miners[miner_id]['shares']
-        }
-
-    def distribute_rewards(self):
-        """Distribute rewards to miners"""
-        total_shares = sum(m['shares'] for m in self.miners.values())
-        if total_shares == 0:
-            return False
-        
-        try:
-            # Get current block reward
-            chain_info = requests.get(f"{self.node_url}/network/info", timeout=5).json()
-            block_reward = chain_info.get('block_reward', 80)
             
-            # Calculate rewards
-            fee = (block_reward * self.fee_percent) / 100
-            reward_pool = block_reward - fee
-            
-            # Send rewards
-            for miner_id, miner_data in self.miners.items():
-                if miner_data['shares'] > 0:
-                    reward = (miner_data['shares'] / total_shares) * reward_pool
-                    if reward > 0:
-                        requests.post(
-                            f"{self.node_url}/transaction/create",
-                            json={
-                                'sender': self.reward_address,
-                                'recipient': miner_id,
-                                'amount': reward,
-                                'seed': 'POOL_REWARD_SEED'
-                            },
-                            timeout=10
-                        )
-            
-            # Reset shares
-            self.miners.clear()
-            return True
-        except Exception as e:
-            print(f"Reward distribution failed: {str(e)}")
-            return False
-
-    def cleanup_inactive_miners(self):
-        """Remove inactive miners"""
-        while True:
-            inactive_time = time.time() - 3600  # 1 hour threshold
-            to_remove = [
-                mid for mid, m in self.miners.items() 
-                if m['last_active'] < inactive_time
-            ]
-            for mid in to_remove:
-                self.miners.pop(mid)
-            time.sleep(60)
-
-class PoolHTTPHandler(BaseHTTPRequestHandler):
-    def __init__(self, pool, *args, **kwargs):
-        self.pool = pool
-        super().__init__(*args, **kwargs)
-    
-    def do_GET(self):
-        if self.path == '/getwork':
-            with self.pool.work_lock:
-                if not self.pool.current_work:
-                    self.send_error(503, 'No work available')
-                    return
+            if resp.status_code == 200:
+                # Block accepted, distribute rewards
+                self.distribute_rewards(miner_address)
+                return True
                 
-                work = {
-                    'prev_proof': self.pool.current_work['prev_proof'],
-                    'height': self.pool.current_work['height'],
-                    'share_target': hex(self.pool.current_work['share_target'])[2:]
-                }
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps(work).encode())
+        except Exception as e:
+            print(f"Error submitting block: {e}")
+            
+        return False
         
-        elif self.path == '/pool/stats':
-            stats = {
-                'miners': len(self.pool.miners),
-                'total_shares': sum(m['shares'] for m in self.pool.miners.values()),
-                'difficulty': self.pool.share_difficulty
-            }
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(stats).encode())
+    def distribute_rewards(self, finder_address):
+        """Distribute block rewards to miners"""
+        total_shares = sum(self.shares.values())
+        if total_shares == 0:
+            return
+            
+        # Calculate pool fee
+        pool_fee = BLOCK_REWARD * (POOL_FEE_PERCENT / 100)
+        remaining_reward = BLOCK_REWARD - pool_fee
         
-        else:
-            self.send_error(404)
+        # Distribute to miners proportionally
+        for address, shares in self.shares.items():
+            reward = (shares / total_shares) * remaining_reward
+            self.miners[address]['pending_payout'] += reward
+            
+        # Bonus for block finder (5% of remaining reward)
+        finder_bonus = remaining_reward * 0.05
+        self.miners[finder_address]['pending_payout'] += finder_bonus
+        
+        # Reset shares for next round
+        self.shares.clear()
+        
+    def process_payouts(self):
+        """Send accumulated balances to miners"""
+        for address, miner in self.miners.items():
+            if miner['pending_payout'] >= PAYOUT_THRESHOLD:
+                # In a real implementation, we'd send the transaction here
+                print(f"Would pay {miner['pending_payout']} ZED to {address}")
+                miner['balance'] += miner['pending_payout']
+                miner['pending_payout'] = 0
 
-    def do_POST(self):
-        if self.path == '/submitshare':
-            content_length = int(self.headers['Content-Length'])
-            post_data = json.loads(self.rfile.read(content_length).decode())
-            
-            if 'miner_id' not in post_data or 'proof' not in post_data:
-                self.send_error(400, 'Missing miner_id or proof')
-                return
-            
-            result = self.pool.validate_share(post_data['miner_id'], post_data['proof'])
-            
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(result).encode())
-        
-        else:
-            self.send_error(404)
+# Initialize pool
+pool = Pool()
 
-def run_pool_server(node_url, reward_address, host='0.0.0.0', port=4025):
-    pool = MiningPool(node_url, reward_address)
-    handler = lambda *args: PoolHTTPHandler(pool, *args)
+# Pool API Endpoints
+@app.get("/pool/stats")
+@openapi.description("Get pool statistics")
+async def pool_stats(request):
+    return response.json({
+        "miners": len(pool.miners),
+        "current_height": pool.current_job['height'] if pool.current_job else 0,
+        "total_shares": sum(m['shares'] for m in pool.miners.values()),
+        "pool_fee": POOL_FEE_PERCENT,
+        "payout_threshold": PAYOUT_THRESHOLD
+    })
+
+@app.get("/pool/job")
+@openapi.description("Get current mining job")
+async def get_job(request):
+    miner_address = request.args.get("address")
+    if not miner_address or not AddressGen.validate(miner_address):
+        return response.json({"error": "Invalid miner address"}, status=400)
+        
+    # Update job if stale
+    if time.time() - pool.last_block_update > 30:
+        pool.update_job()
+        
+    if not pool.current_job:
+        return response.json({"error": "No current job available"}, status=503)
+        
+    return response.json({
+        "height": pool.current_job['height'],
+        "prev_hash": pool.current_job['prev_hash'],
+        "share_difficulty": SHARE_DIFFICULTY,
+        "network_difficulty": pool.current_job['difficulty']
+    })
+
+@app.post("/pool/submit")
+@openapi.description("Submit a mining share or block")
+async def submit_share(request):
+    data = request.json
+    miner_address = data.get("address")
+    nonce = data.get("nonce")
     
-    server = HTTPServer((host, port), handler)
-    print(f"Pool server running on {host}:{port}")
-    print(f"Connected to node: {node_url}")
-    print(f"Pool fee: {pool.fee_percent}%")
-    server.serve_forever()
+    if not miner_address or not nonce:
+        return response.json({"error": "Missing parameters"}, status=400)
+        
+    # Check if it's a valid share first
+    if pool.add_share(miner_address, nonce, SHARE_DIFFICULTY):
+        # Check if it's also a valid block
+        if pool.valid_share(nonce, pool.current_job['difficulty']):
+            if pool.submit_block(miner_address, nonce):
+                return response.json({
+                    "status": "block",
+                    "message": "Block found and submitted!"
+                })
+            else:
+                return response.json({
+                    "status": "error",
+                    "message": "Block submission failed"
+                }, status=500)
+                
+        return response.json({"status": "share", "message": "Share accepted"})
+    else:
+        return response.json({"error": "Invalid share"}, status=400)
+
+@app.get("/pool/miner/<address>")
+@openapi.description("Get miner statistics")
+async def miner_stats(request, address):
+    if address not in pool.miners:
+        return response.json({"error": "Miner not found"}, status=404)
+        
+    miner = pool.miners[address]
+    return response.json({
+        "shares": miner['shares'],
+        "pending_payout": miner['pending_payout'],
+        "balance": miner['balance'],
+        "last_share": miner['last_share']
+    })
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--node", required=True, help="ZED node URL")
-    parser.add_argument("--address", required=True, help="Pool reward address")
-    parser.add_argument("--port", type=int, default=4025, help="Pool server port")
-    args = parser.parse_args()
+    # Start job updater
+    pool.update_job()
     
-    run_pool_server(args.node, args.address, port=args.port)
+    # Run pool server
+    app.run(host="0.0.0.0", port=4025)

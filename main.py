@@ -192,7 +192,69 @@ class BlockChain:
         self.SYMBOL = "ZED"
         self.DECIMAL = 18
         
+        # Zedovium Guard
+        self.miner_stats = {}  # Track miner performance
+        self.zedoguard_threshold = 10  # Blocks per hour considered "high power"
+        self.zedoguard_window = 5 * 60  # 5 minute window for stats
+        self.zedoguard = False # Enable Zedovium Guard
         
+        
+    def update_miner_stats(self, miner_address):
+        """Track how often a miner successfully mines blocks"""
+        now = time.time()
+        
+        # Initialize miner stats if not exists
+        if miner_address not in self.miner_stats:
+            self.miner_stats[miner_address] = {
+                'blocks': [],
+                'multiplier': 1.0  # Default no multiplier
+            }
+        
+        # Add this block to miner's history
+        self.miner_stats[miner_address]['blocks'].append(now)
+        
+        # Always clean up old blocks first (outside our 5-minute window)
+        self.miner_stats[miner_address]['blocks'] = [
+            t for t in self.miner_stats[miner_address]['blocks'] 
+            if now - t < self.zedoguard_window
+            
+            ]
+
+        # Add this block to miner's history if it's a new block
+        if miner_address != "node":  # Don't track node's mining
+            self.miner_stats[miner_address]['blocks'].append(now)
+        
+        # Calculate blocks in current window
+        blocks_in_window = len(self.miner_stats[miner_address]['blocks'])
+        
+        # Reset multiplier if below threshold
+        if blocks_in_window <= self.zedoguard_threshold:
+            self.miner_stats[miner_address]['multiplier'] = 1.0
+        else:
+            # Apply multiplier if miner is too fast
+            excess = blocks_in_window - self.zedoguard_threshold
+            self.miner_stats[miner_address]['multiplier'] = 1.0 + (excess * 0.5)
+            
+    def get_miner_difficulty(self, miner_address):
+        """Get adjusted difficulty for a miner"""
+        if miner_address not in self.miner_stats:
+            return self.diff  # Default difficulty
+            
+        # Always check current activity first
+        now = time.time()
+        recent_blocks = [
+            t for t in self.miner_stats[miner_address]['blocks']
+            if now - t < self.zedoguard_window
+        ]
+        
+        # If no recent blocks, reset to normal
+        if not recent_blocks:
+            self.miner_stats[miner_address]['multiplier'] = 1.0
+        if self.zedoguard:
+            return int(self.diff * self.miner_stats[miner_address]['multiplier'])
+        else:
+            return int(self.diff * 1.0)  # No multiplier if Zedovium Guard is off
+    
     def adjust_difficulty(self):
         if len(self.chain) % self.adjustment_interval == 0 and len(self.chain) > 0:
             actual_time = self.chain[-1].timestamp - self.chain[-self.adjustment_interval].timestamp
@@ -352,6 +414,7 @@ class BlockChain:
         
         try: 
             self.mempool.add_transaction(tx)
+            #print(colored(f"Transaction from {sender} to {recipient} for {quantity} added to mempool.", "green")) #Debug
             return {"status": True, "txid": txid}
         except MempoolFullError:
             return {"status": False, "txid": None, "error": "Mempool is full"}
@@ -367,12 +430,13 @@ class BlockChain:
 
         return proofN
 
-    def verifying_proof(self, last_proof, proof):
-        #verifying the proof: does hash(last_proof, proof) contain 4 leading zeroes?
-
+    def verifying_proof(self, last_proof, proof, difficulty=None):
+        """Modified to accept optional custom difficulty"""
+        difficulty = difficulty or self.diff
         guess = f'{last_proof}{proof}'.encode()
         guess_hash = hashlib.blake2b(guess).hexdigest()
-        if not guess_hash.startswith("0" * self.diff):
+
+        if not guess_hash.startswith("0" * difficulty):
             #print(guess_hash)
             return False
         else:
@@ -404,6 +468,23 @@ class BlockChain:
         return block
     
     def submit_mined_block(self, details_miner, proofN, last_hash):
+        # Get the last block first
+        last_block = self.latest_block
+        
+        # Update miner stats and get their current difficulty
+        self.update_miner_stats(details_miner)
+        current_diff = self.get_miner_difficulty(details_miner)
+        
+        # Verify with adjusted difficulty
+        if not self.verifying_proof(last_block.proofN, proofN, current_diff):
+            return ({
+                "status": "error",
+                "message": f"Proof doesn't meet required difficulty (needed: {current_diff})",
+                "required_difficulty": current_diff,
+                "your_difficulty_multiplier": self.miner_stats.get(details_miner, {}).get('multiplier', 1.0)
+            }, 400)
+            
+        # Continue with block creation if proof is valid
         self.new_data(
             sender="node",
             recipient=details_miner,
@@ -481,7 +562,10 @@ async def get_network_info(request):
         "total_supply": blockchain.GetSupply(),
         "difficulty": blockchain.diff,
         "block_reward": blockchain.rewards,
-        "node_count": len(blockchain.nodes)
+        "node_count": len(blockchain.nodes),
+        "threshold": blockchain.zedoguard_threshold,
+        "window": blockchain.zedoguard_window,
+        "zedoguard": blockchain.zedoguard,
     })
 
 @app.get("/network/chain")
@@ -621,6 +705,119 @@ async def get_network_hashrate(request):
         "avg_block_time": avg_block_time,
         "blocks_analyzed": block_count
     })
+    
+@app.get("/network/checkaddrdiff/<address>")
+@openapi.description("Check if an address is mining under normal or high difficulty")
+async def check_address_difficulty(request, address):
+
+    # # Check if address is valid first
+    # if not AddressGen.validate(address):
+    #     return json({
+    #         "status": "error",
+    #         "message": "Invalid address format"
+    #     }, status=400)
+        
+    # # Check if address has mining stats
+    # if address not in blockchain.miner_stats and blockchain.zedoguard or not(blockchain.zedoguard):
+    #     return json({
+    #         "status": "normal",
+    #         "message": "(no mining activity detected)",
+    #         "difficulty_multiplier": 1.0,
+    #         "current_blocks_per_hour": 0,
+    #         "threshold": blockchain.zedoguard_threshold
+    #     })
+        
+        
+    # stats = blockchain.miner_stats[address]
+    # current_bph = len(stats['blocks'])  # blocks per hour
+        
+    # if stats['multiplier'] > 1.0:
+    #     status = "high"
+    #     message = f"Address has high difficulty (mining {current_bph} blocks/hour)"
+    # else:
+    #     status = "normal"
+    #     message = f"Address has normal difficulty (mining {current_bph} blocks/hour)"
+    
+    # if blockchain.zedoguard == True:
+    #     return json({
+    #         "status": status,
+    #         "message": message,
+    #         "difficulty_multiplier": stats['multiplier'],
+    #         "current_blocks_per_hour": current_bph,
+    #         "threshold": blockchain.zedoguard_threshold,
+    #         "base_difficulty": blockchain.diff,
+    #         "effective_difficulty": blockchain.get_miner_difficulty(address)
+    #     })
+    # elif blockchain.zedoguard == False:
+    #     return json({
+    #         "status": "normal",
+    #         "message": "Zedovium Guard is disabled. No difficulty checks.",
+    #         "difficulty_multiplier": 0,
+    #         "current_blocks_per_hour": current_bph,
+    #         "threshold": blockchain.zedoguard_threshold,
+    #         "base_difficulty": blockchain.diff,
+    #         "effective_difficulty": blockchain.get_miner_difficulty(address)
+    #     })
+    
+    if not AddressGen.validate(address):
+        return json({
+            "status": "error",
+            "message": "Invalid address format"
+        }, status=400)
+        
+    # Check if address has mining stats
+    if address in blockchain.miner_stats and blockchain.zedoguard:
+        stats = blockchain.miner_stats[address]
+        current_bph = len(stats['blocks'])
+        if stats['multiplier'] > 1.0:
+            status = "high"
+            message = f"Address has high difficulty (mining {current_bph} blocks/hour)"
+        else:
+            status = "normal"
+            message = f"Address has normal difficulty (mining {current_bph} blocks/hour)"
+            
+        return json({
+            "status": status,
+            "message": message,
+            "difficulty_multiplier": stats['multiplier'],
+            "current_blocks_per_hour": current_bph,
+            "threshold": blockchain.zedoguard_threshold,
+            "base_difficulty": blockchain.diff,
+            "effective_difficulty": blockchain.get_miner_difficulty(address)
+        })
+
+    elif address not in blockchain.miner_stats and blockchain.zedoguard:
+        return json({
+            "status": "normal",
+            "message": "Address has normal difficulty (no mining activity detected)",
+            "difficulty_multiplier": 1.0,
+            "current_blocks_per_hour": 0,
+            "threshold": blockchain.zedoguard_threshold
+        })
+        
+    elif address in blockchain.miner_stats and blockchain.zedoguard == False:
+        stats = blockchain.miner_stats[address]
+        current_bph = len(stats['blocks'])   
+        return json({
+            "status": "normal",
+            "message": "Zedovium Guard is disabled. No difficulty checks.",
+            "difficulty_multiplier": 0,
+            "current_blocks_per_hour": current_bph,
+            "threshold": blockchain.zedoguard_threshold,
+            "base_difficulty": blockchain.diff,
+            "effective_difficulty": blockchain.get_miner_difficulty(address)
+        })
+        
+    elif address not in blockchain.miner_stats and blockchain.zedoguard == False:
+        return json({
+            "status": "normal",
+            "message": "Zedovium Guard is disabled. No mining activity detected.",
+            "difficulty_multiplier": 0,
+            "current_blocks_per_hour": 0,
+            "threshold": blockchain.zedoguard_threshold,
+            "base_difficulty": blockchain.diff,
+            "effective_difficulty": blockchain.get_miner_difficulty(address)
+        })
 
 ####################### Mining ###################################
 
@@ -658,9 +855,11 @@ async def submit_block(request):
         return json({"message": "Invalid timestamp"}, 400)
     
     block = blockchain.submit_mined_block(miner_address, proofN, prev_hash)
-    
-    return json(vars(block), 201)
-
+    try:
+        return json(vars(block), 201)
+    except Exception as e:
+        if block[0]["status"] == "error":
+            return json(block[0])
 
 ####################### USERS ####################################
 @app.get("/user/balance/<address>")

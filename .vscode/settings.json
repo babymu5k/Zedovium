@@ -9,18 +9,19 @@
         ".python-version": true,
         "uv.lock": true,
         "pyproject.toml": true,
-        ".vscode": true,
         "LICENSE": true,
         ".zed_history": true,
-        "logo.jpg": true
+        "logo.jpg": true,
+        ".vscode": true
     },
     "hide-files.files": [
         ".python-version",
         "uv.lock",
         "pyproject.toml",
-        ".vscode",
         "LICENSE",
         ".zed_history",
-        "logo.jpg"
-    ]
+        "logo.jpg",
+        ".vscode"
+    ],
+    "go.toolsEnvVars": {}
 }
