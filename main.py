@@ -29,122 +29,14 @@ from sanic.response import json, text
 from sanic_ext import openapi
 from termcolor import colored
 from web3 import Web3
+from src.node.mempool import Mempool, MempoolFullError
+from src.node.addressgen import AddressGen
 
 with open("src/data/words.txt") as f:
     WORDLIST = [line.strip() for line in f]
     f.close()
     
-class MempoolError(Exception):
-    pass
-
-class MempoolFullError(MempoolError):
-    pass
-
-class DuplicateTxError(MempoolError):
-    pass
-
-
-class Mempool:
-    def __init__(self, max_size=10000, block_tx_limit=512):
-        self.transactions = []
-        self.max_size = max_size  # Prevent memory overload
-        self.block_tx_limit = block_tx_limit
-        # Dynamic Fees
-        self.base_fee = 0.01
-        self.max_fee = 0.05
-        self.fee_step = 0.001
-
-    def get_current_fee_percent(self):
-        """Calculate dynamic fee based on mempool fullness"""
-        mempool_fullness = len(self.transactions) / self.max_size
-        # Linear scaling between base and max fee
-        dynamic_fee = min(
-            self.base_fee + (mempool_fullness * 
-                                   (self.max_fee - self.base_fee)),
-            self.max_fee
-        )
-        # Round to nearest step for cleaner UX
-        return round(dynamic_fee / self.fee_step) * self.fee_step
-        
-    def add_transaction(self, tx):
-        """Add transaction with basic validation"""
-        if len(self.transactions) >= self.max_size:
-            raise MempoolFullError("Mempool at capacity")
-        
-        # Check for duplicates
-        if any(t['txid'] == tx['txid'] for t in self.transactions):
-            raise DuplicateTxError("Transaction already in mempool")
-            
-        self.transactions.append(tx)
-    
-    def get_block_candidates(self):
-        """Select transactions for next block"""
-        sorted_txs = sorted(
-            self.transactions,
-            key=lambda x: x.get('fee', 0), 
-            reverse=True
-        )
-        return sorted_txs[:self.block_tx_limit]
-    
-    def remove_confirmed(self, block_txs):
-        """Remove mined transactions"""
-        txids = {tx['txid'] for tx in block_txs}
-        self.transactions = [
-            tx for tx in self.transactions 
-            if tx['txid'] not in txids
-        ]
-
-
-class AddressGen:
-    @staticmethod
-    def generate(seed=None):
-        """Create a beautiful deterministic address"""
-        seed = seed or secrets.token_hex(16)  # 16 random bytes if no seed
-        
-        # Hash the seed
-        seed_hash = hashlib.sha256(seed.encode()).digest()
-        
-        # Convert to 4 words (from BIP-39 wordlist)
-        word_indices = [
-            int.from_bytes(seed_hash[i:i+2], 'big') % len(WORDLIST)
-            for i in range(0, 8, 2)
-        ]
-        words = [WORDLIST[i] for i in word_indices]
-        
-        # Generate checksum (first 4 chars of hash)
-        phrase = "-".join(words)
-        checksum = hashlib.sha256(phrase.encode()).hexdigest()[:4]
-        
-        return {
-            "address": f"ZED-{phrase}-{checksum}",
-            "seed": seed,  # Keep this secret!
-        }
-
-    @staticmethod
-    def validate(address):
-        """Check if an address is valid"""
-        if not address.startswith("ZED-"):
-            return False
-        
-        parts = address.split("-")
-        if len(parts) != 6:  # ZED + 4 words + checksum
-            return False
-        
-        checksum = parts[-1]
-        phrase = "-".join(parts[1:-1])
-        
-        # Verify checksum
-        expected_checksum = hashlib.sha256(phrase.encode()).hexdigest()[:4]
-        return checksum == expected_checksum
-
-    @staticmethod
-    def verify_ownership(claimed_address, seed):
-        """Verify that seed generates the claimed address"""
-        generated_address = AddressGen.generate(seed)["address"]
-        return generated_address == claimed_address
-
 class Block:
-
     def __init__(self, index, proofN, prev_hash, transactions, timestamp=None):
         self.index = index
         self.proofN = proofN
@@ -185,7 +77,6 @@ class Block:
         )
 
 class BlockChain:
-
     def __init__(self):
         self.chain = self.LoadDB()
         self.mempool = Mempool()
@@ -199,15 +90,19 @@ class BlockChain:
         self.construct_genesis()
         self.diff = self.adjust_difficulty()
         self.save_flag = True  # Flag to control saving
+        self.memo_limit = 64 # Char limit for memos
         if not hasattr(self, 'balances'):
             self.balances = {}
         
         self.totalsupply = self.GetSupply() # Warning this variable only gives tsupply of init
         self.block_hash_map = {block.calculate_hash: block for block in self.chain}
+        
         # Web3 compatibility
         self.CHAIN_ID = 20243
         self.SYMBOL = "ZED"
         self.DECIMAL = 18
+        
+        self.AddressGen = AddressGen(WORDLIST)
         
         # Zedovium Guard
         self.miner_stats = {}  # Track miner performance
@@ -219,7 +114,6 @@ class BlockChain:
         self.tokens = {} # Format: {token_id: {"name": str, "symbol": str, "supply": int, "creator": str, "balances": {address: amount}}}
         
         # Transactions Fees
-        self.transaction_fees = 0.035  # 3.5% transaction fee
         self.transaction_fee_address = self.GetConfig()[0]  # Address to receive transaction fees        
         
     def update_miner_stats(self, miner_address):
@@ -349,13 +243,23 @@ class BlockChain:
         
         # Update balances for transaction fees
         if total_fees > 0:
+            fee_tx = {
+                "sender": "node",
+                "recipient": self.transaction_fee_address,
+                "quantity": total_fees,
+                "fee": 0,
+                "txid": self.calculate_txid(time.time(), len(self.chain)),
+                "timestamp": time.time(),
+                "memo": "Total Network Fees payment"
+            }
+            transactions.append(fee_tx)
             self.balances[self.transaction_fee_address] = self.balances.get(self.transaction_fee_address, 0) + total_fees
             
         block = Block(
             index=len(self.chain),
             proofN=proofN,
             prev_hash=prev_hash,
-            transactions=self.mempool.get_block_candidates())
+            transactions=transactions)
         self.current_transactions = []
 
         self.chain.append(block)
@@ -396,26 +300,26 @@ class BlockChain:
         tx_string = "{}{}".format(timestamp, index)
         return hashlib.blake2b(tx_string.encode()).hexdigest()   
 
-    def new_transaction(self, sender, recipient, quantity, seed):
+    def new_transaction(self, sender, recipient, quantity, seed, memo = None):
         """Add a signed transaction"""
         # 1. Validate addresses
-        if not AddressGen.validate(sender) or not AddressGen.validate(recipient):
+        if not self.AddressGen.validate(sender) or not self.AddressGen.validate(recipient):
             return {"status": False, "txid": None, "error": "Invalid address(es)"}
 
         # Verify seed matches sender_address
-        if not AddressGen.verify_ownership(sender, seed):
-            return False
-
+        if not self.AddressGen.verify_ownership(sender, seed):
+            return {"status": False, "txid": None, "error": "Seed does not match sender address"}
 
         status = self.new_data(
             sender=sender,
             recipient=recipient,
-            quantity=quantity
+            quantity=quantity,
+            memo=memo
         )
         
         return status
 
-    def new_data(self, sender, recipient, quantity): # Used for appending/updating transactions to blc
+    def new_data(self, sender, recipient, quantity, memo): # Used for appending/updating transactions to blc
         current_fee_percent = self.mempool.get_current_fee_percent()
         fee = quantity * current_fee_percent
         totaltxspend = quantity + fee
@@ -440,6 +344,18 @@ class BlockChain:
         if sender == "node":
             fee = 0
         
+        if memo == None:
+            tx = {
+                'sender': sender,
+                'recipient': recipient,
+                'quantity': quantity,
+                'fee': fee, # Add fee to transaction
+                'fee_percent': current_fee_percent,
+                'txid': txid,
+                'timestamp': time.time(),
+                'memo': 'None'# First 64 Charecters
+            }
+        
         tx = {
             'sender': sender,
             'recipient': recipient,
@@ -448,12 +364,14 @@ class BlockChain:
             'fee_percent': current_fee_percent,
             'txid': txid,
             'timestamp': time.time(),
+            'memo': memo[:self.memo_limit]# First 64 Charecters
         }
-        
+          
         try: 
             self.mempool.add_transaction(tx)
             #print(colored(f"Transaction from {sender} to {recipient} for {quantity} added to mempool.", "green")) #Debug
             return {"status": True, "txid": txid, "fee": fee}
+        
         except MempoolFullError:
             return {"status": False, "txid": None, "error": "Mempool is full"}
 
@@ -492,6 +410,7 @@ class BlockChain:
             recipient=details_miner,
             quantity=
             self.rewards,  #creating a new block (or identifying the proof number) is awarded with 1
+            memo="BLock has been mined (Yay!)"
         )
 
         last_block = self.latest_block
@@ -526,7 +445,8 @@ class BlockChain:
         self.new_data(
             sender="node",
             recipient=details_miner,
-            quantity=self.rewards
+            quantity=self.rewards,
+            memo="BLock has been mined (Yay!)"
         )
         block = self.construct_block(proofN, last_hash)
         self.balances[details_miner] = self.balances.get(details_miner, 0) + self.rewards
@@ -539,6 +459,12 @@ class BlockChain:
 
     def get_balance(self, user):
         return self.balances.get(user, 0)
+
+    def diff_at_height(self, height):
+        """Get difficulty at specific block height"""
+        if height < len(self.chain):
+            return self.chain[height].difficulty if hasattr(self.chain[height], 'difficulty') else self.diff
+        return self.diff
     
     def block_by_hash(self, block_hash):
         for block in self.chain:
@@ -789,7 +715,7 @@ async def fee_chart(request):
 @app.get("/network/checkaddrdiff/<address>")
 @openapi.description("Check if an address is mining under normal or high difficulty")
 async def check_address_difficulty(request, address):
-    if not AddressGen.validate(address):
+    if not blockchain.AddressGen.validate(address):
         return json({
             "status": "error",
             "message": "Invalid address format"
@@ -893,6 +819,87 @@ async def submit_block(request):
         if block[0]["status"] == "error":
             return json(block[0])
 
+@app.get("/network/block/<block_identifier>/transactions")
+@openapi.description("Get all transactions from a block (by number or hash)")
+async def get_block_transactions(request, block_identifier: str):
+    # Try to find block by number first
+    try:
+        block_num = int(block_identifier)
+        if block_num >= len(blockchain.chain):
+            return json({"error": "Block number out of range"}, status=404)
+        block = blockchain.chain[block_num]
+    except ValueError:
+        # If not a number, try to find by hash
+        block = None
+        for b in blockchain.chain:
+            if b.calculate_hash == block_identifier:
+                block = b
+                break
+        if not block:
+            return json({"error": "Block not found"}, status=404)
+    
+    # Format transactions with enhanced data
+    formatted_txs = []
+    for tx in block.transactions:
+        formatted_tx = {
+            "txid": tx['txid'],
+            "sender": tx['sender'],
+            "recipient": tx['recipient'],
+            "amount": tx['quantity'],
+            "fee": tx.get('fee', 0),
+            "timestamp": tx['timestamp'],
+            "memo": tx.get('memo', ""),
+            "position_in_block": block.transactions.index(tx),
+            "block_height": block.index,
+            "block_hash": block.calculate_hash
+        }
+        formatted_txs.append(formatted_tx)
+    
+    return json({
+        "block_height": block.index,
+        "block_hash": block.calculate_hash,
+        "timestamp": block.timestamp,
+        "transaction_count": len(block.transactions),
+        "transactions": formatted_txs
+    })
+
+
+@app.get("/network/block/<block_identifier>/summary")
+@openapi.description("Get key block statistics")
+async def get_block_summary(request, block_identifier: str):
+    # Same block finding logic as above
+    try:
+        block_num = int(block_identifier)
+        if block_num >= len(blockchain.chain):
+            return json({"error": "Block number out of range"}, status=404)
+        block = blockchain.chain[block_num]
+    except ValueError:
+        block = None
+        for b in blockchain.chain:
+            if b.calculate_hash == block_identifier:
+                block = b
+                break
+        if not block:
+            return json({"error": "Block not found"}, status=404)
+    
+    # Calculate block statistics
+    total_fees = sum(tx.get('fee', 0) for tx in block.transactions)
+    
+    return json({
+        "block_height": block.index,
+        "block_hash": block.calculate_hash,
+        "miner": next(
+            (tx['recipient'] for tx in block.transactions 
+            if tx['sender'] == "node"), "unknown"),
+        "total_transactions": len(block.transactions),
+        "total_value": sum(tx['quantity'] for tx in block.transactions),
+        "total_fees": total_fees,
+        "miner_reward": blockchain.rewards,
+        "timestamp": block.timestamp,
+        "previous_block": block.prev_hash,
+        "difficulty": blockchain.diff_at_height(block.index)  # You'll need to implement this
+    })
+
 ####################### USERS ####################################
 @app.get("/user/balance/<address>")
 @openapi.description("Get user balance")
@@ -909,7 +916,7 @@ async def get_balance(request, address):
 @app.get("/wallet/create")
 @openapi.description("Create a new wallet")
 async def CreateWallet(request):
-    wallet = AddressGen.generate()
+    wallet = blockchain.AddressGen.generate()
 
     return json({
         "address": wallet['address'],
@@ -922,7 +929,7 @@ async def CreateWallet(request):
 # import an existing seed
 async def ImportWallet(request):
     seed = request.json.get("seed", None)
-    wallet = AddressGen.generate(seed)
+    wallet = blockchain.AddressGen.generate(seed)
     
     return json({
         "address": wallet['address'],
@@ -934,7 +941,7 @@ async def ImportWallet(request):
 async def validate_address(request, address):
     return json({
         "address": address,
-        "is_valid": AddressGen.validate(address)
+        "is_valid": blockchain.AddressGen.validate(address)
     })
 
 @app.post("/transaction/create")
@@ -945,6 +952,10 @@ async def create_transaction(request):
     recipient = data.get('recipient')
     amount = data.get('amount')
     seed = data.get('seed')
+    try:
+        memo = data.get('memo')
+    except:
+        memo = None
     
     if not all([sender, recipient, amount, seed]):
         return json({"status": False, "error": "Invalid Parameters"}, 400)
@@ -954,8 +965,7 @@ async def create_transaction(request):
     except:
         return json({"status": False, "error": "Invalid Amount"}, 400)
     
-    success = blockchain.new_transaction(sender, recipient, amount, seed)
-
+    success = blockchain.new_transaction(sender, recipient, amount, seed, memo)
     return json(success)
 
 
@@ -1230,7 +1240,7 @@ async def serve_openapi_spec(request):
 def greeter():
     if os.path.exists("src/data/config.json"):
         data = jsonify.load(open("src/data/config.json", "r"))
-        address = AddressGen.validate(data["address"])
+        address = blockchain.AddressGen.validate(data["address"])
         if address:
             print(colored(f"Welcome back {data['address']}!", "green"))
         else:

@@ -6,3 +6,4 @@ src/data/blockchain.json
 test.py
 src/data/config.json
 .vscode
+src/node/__pycache__

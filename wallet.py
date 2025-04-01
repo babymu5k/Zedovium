@@ -39,7 +39,8 @@ class ZEDWalletCLI(cmd.Cmd):
             "blocktime",
             "unconfirmed",
             "zedoguard",
-            "estimate"
+            "estimate",
+            "blocktx",
         ]
         self.completer = WordCompleter(self.commands)
         self.NODE_URL = self.getnode()
@@ -170,7 +171,7 @@ class ZEDWalletCLI(cmd.Cmd):
         print(f"\nBalance: {balance} ZED\n")
 
     def do_send(self, arg):
-        """Send ZED to another address: send [amount] [recipient]"""
+        """Send ZED to another address (memo max limit=64): send [amount] [recipient] [memo]"""
         if not self.current_wallet:
             print("No wallet loaded. Use 'new' or 'load' first.")
             return
@@ -183,6 +184,11 @@ class ZEDWalletCLI(cmd.Cmd):
         try:
             amount = float(args[0])
             recipient = args[1]
+            try:
+                memo = args[2]
+            except IndexError:
+                memo = None
+            fee = requests.get(f"{self.NODE_URL}/network/fee_estimate").json()
 
             # Validate recipient address
             if self.validate(recipient) == False:
@@ -197,6 +203,13 @@ class ZEDWalletCLI(cmd.Cmd):
 
             # Confirm transaction
             print(f"\nSending {amount} ZED to {recipient}")
+            print(colored(f"\nEstimated TX fee: {fee['fee']*amount} ZED", "yellow"))
+            print(
+                colored(
+                    f"Estimated Deduction: {amount + fee['fee']*amount} ZED", "yellow"
+                )
+            )
+            print(f"Current Fee Percentage: {fee['current_fee_percent']}%\n")
             confirm = input("Confirm? (y/n): ").lower()
             if confirm != "y":
                 print("Transaction canceled")
@@ -210,6 +223,7 @@ class ZEDWalletCLI(cmd.Cmd):
                     "recipient": recipient,
                     "amount": amount,
                     "seed": self.current_wallet["seed"],
+                    "memo": memo,
                 },
             )
 
@@ -321,11 +335,12 @@ class ZEDWalletCLI(cmd.Cmd):
                     else:
                         print(f"To: {tx.get('recipient', 'N/A')}")
                     print(f"Amount: {tx.get('quantity', 'N/A')} ZED")
-                    print(f"Fee: {round(tx.get('fee', 'N/A'), 3)} ZED")
+                    print(f"Fee: {round(tx.get('fee', 'N/A'), 4)} ZED")
                     # print(f"Timestamp: {tx.get('timestamp', 'N/A')}")
                     print(
                         f"Timestamp: {datetime.datetime.fromtimestamp(tx.get('timestamp', 'N/A')):%Y-%m-%d %H:%M:%S} ({tx.get('timestamp', 'N/A')})"
                     )
+                    print(f"Memo: {tx.get('memo')}")
                     print("-" * 80)
 
                 print()
@@ -380,6 +395,7 @@ class ZEDWalletCLI(cmd.Cmd):
                 print(
                     f"Timestamp: {datetime.datetime.fromtimestamp(transaction['timestamp']):%Y-%m-%d %H:%M:%S} ({transaction['timestamp']})"
                 )
+                print(f"Memo: {transaction['memo']}")
                 print("-" * 80)
 
     def do_zedoguard(self, arg):
@@ -424,22 +440,91 @@ class ZEDWalletCLI(cmd.Cmd):
                 estimated_fee = amount * fee
                 txamount = amount + estimated_fee
                 print(colored(f"\nTotal transaction amount: {txamount} ZED", "blue"))
-                print(f"\nCurrent fee: {fee} ZED")
-                print(f"Estimated fee: {estimated_fee} ZED")
+                # print(f"\nCurrent fee: {fee} ZED")
+                print(f"Estimated fee: {round(estimated_fee, 4)} ZED")
                 print(f"Fee percentage: {fee_percentage}%")
                 print(f"Mempool utilization: {fee_percent['mempool_utilization']}")
                 print(f"Total Fees in Mempool: {fee_percent['total_fees']} ZED")
-                
+
             except ValueError:
                 print("Invalid amount")
                 return
-        
+
         if not arg:
             print(f"Current fee: {fee} ZED")
             print(f"Fee percentage: {fee_percentage}%")
             print(f"Mempool utilization: {fee_percent['mempool_utilization']}")
             print(f"Total Fees in Mempool: {fee_percent['total_fees']} ZED")
             return
+
+    def do_blocktx(self, arg):
+        """Get transactions from a specific block: blocktx [height|hash]"""
+        if not arg:
+            print("Usage: blocktx [block_height|block_hash]")
+            return
+
+        try:
+            response = requests.get(f"{self.NODE_URL}/network/block/{arg}/transactions")
+            if response.status_code == 200:
+                data = response.json()
+                print(f"\n=== Block {data['block_height']} ===")
+                print(f"Hash: {data['block_hash']}")
+                print(
+                    f"Timestamp: {datetime.datetime.fromtimestamp(data['timestamp'])}"
+                )
+                print(f"Total transactions: {data['transaction_count']}\n")
+
+                for tx in data["transactions"]:
+                    print("-" * 80)
+                    print(f"TXID: {tx['txid']}")
+                    print(f"Position: {tx['position_in_block']}")
+                    if tx["sender"] == getattr(self.current_wallet, "address", ""):
+                        print(colored(f"From: {tx['sender']} (you)", "blue"))
+                    else:
+                        print(f"From: {tx['sender']}")
+                    if tx["recipient"] == getattr(self.current_wallet, "address", ""):
+                        print(colored(f"To: {tx['recipient']} (you)", "blue"))
+                    else:
+                        print(f"To: {tx['recipient']}")
+                    print(f"Amount: {tx['amount']} ZED")
+                    print(f"Fee: {tx['fee']} ZED")
+                    if tx.get("memo"):
+                        print(f"Memo: {tx['memo']}")
+                    print("-" * 80)
+                print()
+            else:
+                print(f"\nError: {response.json().get('error', 'Unknown error')}\n")
+        except requests.exceptions.RequestException as e:
+            print(f"\nConnection error: {e}\n")
+
+    def do_blockinfo(self, arg):
+        """Get block summary: blockinfo [height|hash]"""
+        if not arg:
+            print("Usage: blockinfo [block_height|block_hash]")
+            return
+
+        try:
+            response = requests.get(f"{self.NODE_URL}/network/block/{arg}/summary")
+            if response.status_code == 200:
+                data = response.json()
+                print("\n=== Block Summary ===")
+                print(f"Height: {data['block_height']}")
+                print(f"Hash: {data['block_hash']}")
+                print(f"Miner: {data['miner']}")
+                print(
+                    f"Timestamp: {datetime.datetime.fromtimestamp(data['timestamp'])}"
+                )
+                print(f"Difficulty: {data['difficulty']}")
+                print(f"Transactions: {data['total_transactions']}")
+                print(f"Total value moved: {data['total_value']} ZED")
+                print(f"Total fees: {data['total_fees']} ZED")
+                print(f"Miner reward: {data['miner_reward']} ZED")
+                print(f"Previous block: {data['previous_block']}")
+                print()
+            else:
+                print(f"\nError: {response.json().get('error', 'Unknown error')}\n")
+        except requests.exceptions.RequestException as e:
+            print(f"\nConnection error: {e}\n")
 
     def emptyline(self):
         pass

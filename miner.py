@@ -168,7 +168,7 @@ def print_mining_stats(diff, hash_rate, block_height, blocks_mined):
 def mine(zedoguard_active):
     node = get_node()
     print_header()
-    miner_address = "ZED-alien-ladybug-glow-garden-cecd"  # Replace with your miner address
+    miner_address = "ZED-forest-vanilla-sculpture-diamond-7b4e"  # Replace with your miner address
     blocks_mined = 0  # Add counter for mined blocks
     blocks_mined = 0
     last_speed_check = 0
