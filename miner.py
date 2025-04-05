@@ -4,6 +4,7 @@ import requests
 import random
 import sys
 from datetime import datetime
+import json
 
 
 # ANSI color codes
@@ -22,6 +23,8 @@ COLORS = {
 CLEAR_SCREEN = '\033[2J\033[H'
 CURSOR_UP = '\033[1A'
 CLEAR_LINE = '\033[2K'
+
+config = json.load(open("src/data/config.json", "r"))
 
 def CheckZedoGuard(node):
     """Check if ZedoGuard is active"""
@@ -126,7 +129,7 @@ def format_hash_rate(hash_rate):
         hash_rate /= 1000
         unit_index += 1
     return f"{hash_rate:.2f} {units[unit_index]}"
-def print_header():
+def print_header(address):
     clear_screen()
     print(f"{COLORS['cyan']}╔══════════════════════════════════════════════════╗")
     print(f"║{COLORS['yellow']}          ZEDOVIUM MINER v0.1.0 (Python)          {COLORS['cyan']}║")
@@ -136,7 +139,7 @@ def print_header():
     print(f"║{COLORS['white']}       Official miner for Zedovium Network        {COLORS['cyan']}║")
     print(f"╚══════════════════════════════════════════════════╝{COLORS['reset']}")
     print(f"{COLORS['blue']}⏣  Connected to network: {COLORS['green']}Zedovium Mainnet")
-    print(f"{COLORS['blue']}⏣  Miner address: {COLORS['yellow']}ZED-alien-ladybug-glow-garden-cecd")
+    print(f"{COLORS['blue']}⏣  Miner address: {COLORS['yellow']}{address}")
     print(f"{COLORS['blue']}⏣  Started at {datetime.now().strftime('%I:%M:%S')}{COLORS['reset']}")
     print("\n" + "-" * 60 + "\n")  # Separator line
     print(f"{COLORS['cyan']}⚙  Current Stats:{COLORS['reset']}\n")
@@ -167,8 +170,8 @@ def print_mining_stats(diff, hash_rate, block_height, blocks_mined):
 
 def mine(zedoguard_active):
     node = get_node()
-    print_header()
-    miner_address = "ZED-forest-vanilla-sculpture-diamond-7b4e"  # Replace with your miner address
+    print_header(config["address"])
+    miner_address = config["address"]
     blocks_mined = 0  # Add counter for mined blocks
     blocks_mined = 0
     last_speed_check = 0

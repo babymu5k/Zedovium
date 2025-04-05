@@ -50,6 +50,9 @@ Zedovium is a **Proof-of-Work (PoW) blockchain** with dynamic transaction fees, 
 | `GET /network/chain` | Full blockchain data |  
 | `GET /network/latestblock` | Latest block details |  
 | `GET /network/hashrate` | Estimated network hashrate |  
+| `GET /network/block/<txid/num>/summary`| Get the summary of a block |
+| `GET /network/block/<txid/num>/transactions`| Get the transactions of a block |
+
 
 ### **🔹 Transactions & Fees**  
 | Endpoint | Description |  
@@ -144,7 +147,7 @@ GNU General Public License v3.0
 ✅ **Dynamic fees** prevent congestion exploitation  
 ✅ **Zedovium Guard** keeps mining decentralized  
 ✅ **BLAKE2b** ensures fast & secure hashing  
-✅ **Full Web3 RPC** support for compatibility  
+✅ **Partial Web3 RPC** currently implementing support for compatibility  
 
 For more details, check the [OpenAPI spec](#) (if implemented).
 Check out the [Discord](https://discord.gg/zYdeBw7gwB)
