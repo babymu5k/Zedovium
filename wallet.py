@@ -9,6 +9,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import WordCompleter
 from termcolor import colored
+from src.node.addressgen import AddressGen
 
 
 class ZEDWalletCLI(cmd.Cmd):
@@ -22,6 +23,10 @@ class ZEDWalletCLI(cmd.Cmd):
         self.session = PromptSession(
             history=FileHistory(".zed_history"), auto_suggest=AutoSuggestFromHistory()
         )
+        with open("src/data/words.txt", "r") as f:
+            WORDLIST = [line.strip() for line in f]
+            self.addressgen = AddressGen(WORDLIST)
+            f.close()
 
         # Set up command completer
         self.commands = [
@@ -100,9 +105,8 @@ class ZEDWalletCLI(cmd.Cmd):
     def do_new(self, arg):
         """Create a new wallet: new"""
         try:
-            response = requests.get(f"{self.NODE_URL}/wallet/create")
-            if response.status_code == 200:
-                wallet = response.json()
+            wallet = self.addressgen.generate()
+            if wallet:
                 self.current_wallet = wallet
                 print("\n=== New Wallet Created ===")
                 print(f"Address: {wallet['address']}")
@@ -115,7 +119,7 @@ class ZEDWalletCLI(cmd.Cmd):
                     json.dump(wallet_data, wallet_file, indent=4)
                 print("Wallet details saved to 'src/data/config.json'")
             else:
-                print(f"\nError creating wallet: {response.text}\n")
+                print(f"\nError creating wallet\n")
         except requests.exceptions.RequestException as e:
             print(f"\nConnection error: {e}\n")
 
