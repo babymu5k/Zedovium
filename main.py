@@ -31,6 +31,8 @@ from termcolor import colored
 from web3 import Web3
 from src.node.mempool import Mempool, MempoolFullError
 from src.node.addressgen import AddressGen
+from src.node.P2P import P2PNetwork
+import random, asyncio
 
 with open("src/data/words.txt") as f:
     WORDLIST = [line.strip() for line in f]
@@ -84,7 +86,7 @@ class BlockChain:
         self.nodes = set()
         self.diff = 1  # Initial difficulty
         self.block_time_target = 5 * 60 # 5 minutes in seconds
-        self.adjustment_interval = 12  # Adjust every 12 blocks/ one hour
+        self.adjustment_interval = 72  # Adjust every 72 blocks / six hours
 
         self.rewards = 80 # Rewards for every block
         self.construct_genesis()
@@ -110,11 +112,109 @@ class BlockChain:
         self.zedoguard_window = 5 * 60  # 5 minute window for stats
         self.zedoguard = False # Enable Zedovium Guard
         
-        # Tokens #TODO: Add later
+        #Tokens #TODO: Add later
         self.tokens = {} # Format: {token_id: {"name": str, "symbol": str, "supply": int, "creator": str, "balances": {address: amount}}}
         
         # Transactions Fees
-        self.transaction_fee_address = self.GetConfig()[0]  # Address to receive transaction fees        
+        self.transaction_fee_address = self.GetConfig()[0]  # Address to receive transaction fees 
+        
+        # P2P
+        self.p2p = P2PNetwork(self)
+        
+    def resolve_conflicts(self):
+        """
+        This is our consensus algorithm, it resolves conflicts
+        by replacing our chain with the longest one in the network.
+        """
+        neighbours = self.p2p.connected_peers
+        new_chain = None
+
+        # We're only looking for chains longer than ours
+        max_length = len(self.chain)
+
+        # Grab and verify the chains from all the nodes in our network
+        for node in neighbours:
+            try:
+                response = requests.get(f'http://{node}/network/chain')
+                if response.status_code == 200:
+                    length = response.json()['length']
+                    chain = response.json()['chain']
+
+                    # Check if the length is longer and the chain is valid
+                    if length > max_length and self.valid_chain(chain):
+                        max_length = length
+                        new_chain = chain
+            except:
+                continue
+
+        # Replace our chain if we discovered a new, valid chain longer than ours
+        if new_chain:
+            self.chain = [Block.from_dict(block) for block in new_chain]
+            self.SaveDB()
+            return True
+
+        return False
+    
+    def valid_chain(self, chain):
+        """
+        Determine if a given blockchain is valid
+        """
+        if not isinstance(chain, list):
+            return False
+            
+        # Convert dicts to Block objects
+        try:
+            chain = [Block.from_dict(block) for block in chain]
+        except:
+            return False
+
+        # Check the genesis block matches
+        if chain[0].calculate_hash != self.chain[0].calculate_hash:
+            return False
+
+        # Check each subsequent block
+        for i in range(1, len(chain)):
+            current = chain[i]
+            previous = chain[i-1]
+
+            # Check that the hash of the block is correct
+            if current.calculate_hash != current.calculate_hash:
+                return False
+
+            # Check that the Proof of Work is correct
+            if not self.verifying_proof(previous.proofN, current.proofN):
+                return False
+
+        return True
+
+    def broadcast_block(self, block):
+        """Broadcast a new block to all peers"""
+        block = Block.to_dict(block)
+        if len(self.chain) > 1: # Only Broadcast if it isnt genesis block
+            for peer in self.p2p.connected_peers:
+                try:
+                    requests.post(
+                        f"http://{peer}/block/new",
+                        json=block,
+                        timeout=3
+                    )
+                except Exception as e:
+                    print(e)
+        else:
+            pass
+                
+    def broadcast_transaction(self, transaction):
+        """Broadcast a new transaction to all peers"""
+        for peer in self.p2p.connected_peers:
+            try:
+                requests.post(
+                    f"http://{peer}/transaction/new",
+                    json=transaction,
+                    timeout=3
+                )
+            except:
+                continue
+
         
     def update_miner_stats(self, miner_address):
         """Track how often a miner successfully mines blocks"""
@@ -173,18 +273,39 @@ class BlockChain:
             return int(self.diff * 1.0)  # No multiplier if Zedovium Guard is off
     
     def adjust_difficulty(self):
-        if len(self.chain) % self.adjustment_interval == 0 and len(self.chain) > 0:
+        """More sophisticated difficulty adjustment algorithm"""
+        if len(self.chain) % self.adjustment_interval == 0:
+            # Calculate block time ratio
             actual_time = self.chain[-1].timestamp - self.chain[-self.adjustment_interval].timestamp
             expected_time = self.block_time_target * self.adjustment_interval
             ratio = actual_time / expected_time
-            
-            if ratio < 1:
-                self.diff += 1
-            elif ratio > 1:
-                self.diff = max(1, self.diff -1)
 
-            print(colored(f"Difficulty readjusted to {self.diff}", "blue"))
+            # Dynamic smoothing factor (α)
+            if not hasattr(self, 'difficulty_ema'):
+                self.difficulty_ema = 1.0  # Initialize
             
+            # Choose α based on market conditions
+            if abs(ratio - self.difficulty_ema) > 0.2:
+                alpha = 0.5  # Aggressive for large deviations
+            else:
+                alpha = 0.3  # Conservative otherwise
+            
+            # Update EMA
+            self.difficulty_ema = alpha * ratio + (1 - alpha) * self.difficulty_ema
+
+            # Adjust difficulty
+            if self.difficulty_ema < 0.9:
+                self.diff += 1
+            elif self.difficulty_ema > 1.1:
+                self.diff = max(1, self.diff - 1)
+            
+            print(colored(
+                f"Difficulty adjusted to {self.diff} "
+                f"(EMA: {self.difficulty_ema:.2f}, "
+                f"Actual: {actual_time:.1f}s, "
+                f"Expected: {expected_time:.1f}s)", 
+                "blue"))
+        
         return self.diff
             
     def GetSupply(self):
@@ -273,6 +394,7 @@ class BlockChain:
         
         self.adjust_difficulty()  # Adjust difficulty after adding a new block
         self.mempool.remove_confirmed(block.transactions)  # Remove confirmed transactions
+        self.broadcast_block(block) # Broadcast
 
         return block
 
@@ -298,7 +420,7 @@ class BlockChain:
 
     def calculate_txid(self, timestamp, index):
         tx_string = "{}{}".format(timestamp, index)
-        return hashlib.blake2b(tx_string.encode()).hexdigest()   
+        return hashlib.blake2b(tx_string.encode(), digest_size=32).hexdigest() # Smaller TXIDs
 
     def new_transaction(self, sender, recipient, quantity, seed, memo = None):
         """Add a signed transaction"""
@@ -370,6 +492,7 @@ class BlockChain:
         try: 
             self.mempool.add_transaction(tx)
             #print(colored(f"Transaction from {sender} to {recipient} for {quantity} added to mempool.", "green")) #Debug
+            self.broadcast_transaction(tx)
             return {"status": True, "txid": txid, "fee": fee}
         
         except MempoolFullError:
@@ -393,36 +516,33 @@ class BlockChain:
         guess_hash = hashlib.blake2b(guess).hexdigest()
 
         if not guess_hash.startswith("0" * difficulty):
-            #print(guess_hash)
             return False
         else:
-            #print(guess_hash)
             return True
 
     @property
     def latest_block(self):
         return self.chain[-1]
 
-    def block_mining(self, details_miner):
+    # def block_mining(self, details_miner):
+    #     self.new_data(
+    #         sender="node",  #it implies that this node has created a new block
+    #         recipient=details_miner,
+    #         quantity=
+    #         self.rewards,  #creating a new block (or identifying the proof number) is awarded with 1
+    #         memo="BLock has been mined (Yay!)"
+    #     )
 
-        self.new_data(
-            sender="node",  #it implies that this node has created a new block
-            recipient=details_miner,
-            quantity=
-            self.rewards,  #creating a new block (or identifying the proof number) is awarded with 1
-            memo="BLock has been mined (Yay!)"
-        )
+    #     last_block = self.latest_block
 
-        last_block = self.latest_block
+    #     last_proofN = last_block.proofN
+    #     proofN = self.proof_of_work(last_proofN) # Soon it will be given by some random miner
 
-        last_proofN = last_block.proofN
-        proofN = self.proof_of_work(last_proofN) # Soon it will be given by some random miner
+    #     last_hash = last_block.calculate_hash
+    #     block = self.construct_block(proofN, last_hash)
+    #     self.balances[details_miner] = self.balances.get(details_miner, 0) + self.rewards
 
-        last_hash = last_block.calculate_hash
-        block = self.construct_block(proofN, last_hash)
-        self.balances[details_miner] = self.balances.get(details_miner, 0) + self.rewards
-
-        return block
+    #     return block
     
     def submit_mined_block(self, details_miner, proofN, last_hash):
         # Get the last block first
@@ -450,6 +570,7 @@ class BlockChain:
         )
         block = self.construct_block(proofN, last_hash)
         self.balances[details_miner] = self.balances.get(details_miner, 0) + self.rewards
+        
         print(colored(f"\n-----------\nNew Block mined!\nHeight: {len(self.chain)}\nMiner: {details_miner}\nReward: {self.rewards} ZED \n-----------\n", "green"))
         return block
 
@@ -577,6 +698,13 @@ def get_transaction(request, txid):
                     "block_height": block.index,
                     "transaction": tx
                 })
+    for tx in blockchain.mempool.transactions:
+        if tx['txid'] == txid:
+            return json({
+                "block_height": None,
+                "status": "unconfirmed in mempool",
+                "transaction": tx
+            }) 
     return json({
         "ERROR": f"{txid} not found"
     }, 404)
@@ -897,7 +1025,7 @@ async def get_block_summary(request, block_identifier: str):
         "miner_reward": blockchain.rewards,
         "timestamp": block.timestamp,
         "previous_block": block.prev_hash,
-        "difficulty": blockchain.diff_at_height(block.index)  # You'll need to implement this
+        "difficulty": blockchain.diff_at_height(block.index)
     })
 
 ####################### USERS ####################################
@@ -991,6 +1119,88 @@ async def mempool_transactions(request):
         "transactions": blockchain.mempool.transactions[:count]
     })
     
+############################# P2P network ##################################
+
+@app.post("/block/new")
+@openapi.description("Receive a new block from the network")
+async def new_block(request):
+    block_data = request.json
+    try:
+        block = Block.from_dict(block_data)
+    except:
+        return json({"status": "error", "message": "Invalid block data"}, 400)
+        
+    # Check if we already have this block
+    if block.calculate_hash in blockchain.block_hash_map:
+        return json({"status": "duplicate"}, 200)
+        
+    # Check if block is valid
+    if not blockchain.verifying_proof(block.proofN, blockchain.latest_block.proofN):
+        return json({"status": "error", "message": "Invalid block"}, 400)
+        
+    # Add to our chain
+    blockchain.chain.append(block)
+    blockchain.block_hash_map[block.calculate_hash] = block
+    blockchain.SaveDB()
+    
+    # Remove transactions from mempool
+    blockchain.mempool.remove_confirmed(block.transactions)
+    print(colored(f"\n-----------\nNew Block mined!\nHeight: {len(blockchain.chain)}\nReward: {blockchain.rewards} ZED \n-----------\n", "green"))
+    return json({"status": "success"})
+
+@app.get("/network/peers")
+@openapi.description("Get list of known peers")
+async def get_peers(request):
+    return json({
+        "Online_Peers": list(blockchain.p2p.connected_peers),
+        "Known_Peers": list(blockchain.p2p.peers)
+    })
+
+@app.post("/transaction/new")
+@openapi.description("Receive a new transaction from the network")
+async def new_transaction(request):
+    tx = request.json
+    try:
+        # Basic validation
+        required_fields = ['sender', 'recipient', 'quantity', 'txid']
+        if not all(field in tx for field in required_fields):
+            return json({"status": "error", "message": "Missing required fields"}, 400)
+            
+        # Check if already in mempool
+        if any(t['txid'] == tx['txid'] for t in blockchain.mempool.transactions):
+            return json({"status": "duplicate"}, 200)
+            
+        # Add to mempool
+        blockchain.mempool.add_transaction(tx)
+        return json({"status": "success"})
+        
+    except MempoolFullError:
+        return json({"status": "error", "message": "Mempool full"}, 400)
+    except Exception as e:
+        return json({"status": "error", "message": str(e)}, 400)
+    
+async def network_maintenance():
+    """Background tasks for network maintenance"""
+    while True:
+        try:
+            # Peer discovery
+            blockchain.p2p.discover_peers()
+            
+            # Maintain connections
+            blockchain.p2p.maintain_connections()
+            
+            # Check for chain conflicts periodically
+            if random.random() < 0.1:  # 10% chance each run
+                blockchain.resolve_conflicts()
+                
+        except Exception as e:
+            print(f"Network maintenance error: {e}")
+            
+        await asyncio.sleep(60)  # Run every minute
+
+# Add to your app setup
+app.add_task(network_maintenance())
+
 
 ############################# Web3 Compat layer #############################
 #for metamask very broken though
@@ -1040,7 +1250,10 @@ class Web3RPC:
                     raise ValueError("Missing parameters")
                 address = Web3RPC.eth_to_zed(params[0])
                 balance = blockchain.get_balance(address)
-                return Web3RPC.to_hex(int(balance * (10 ** blockchain.DECIMAL)))
+                print(params[0])
+                print(address)
+                print(balance)
+                return hex(int(balance)*10**blockchain.DECIMAL)
             
             elif method == "eth_getTransactionCount":
                 if len(params) < 2:
@@ -1157,6 +1370,7 @@ class Web3RPC:
 async def handleWeb3Request(request):
     try:
         data = request.json
+        print(data)
         if isinstance(data, dict):
             # Single request
             method = data.get("method")
@@ -1166,6 +1380,7 @@ async def handleWeb3Request(request):
             result = Web3RPC.handle_web3_request(method, params)
             
             if isinstance(result, dict) and "error" in result:
+                print(result)
                 return json({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -1175,6 +1390,7 @@ async def handleWeb3Request(request):
                     }
                 })
             else:
+                print(result)
                 return json({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -1229,13 +1445,13 @@ async def handleWeb3Request(request):
             }
         }, status=500)
 
-# Add these routes to your Sanic app
 @app.route("/openapi.json")
 async def serve_openapi_spec(request):
     # Load your custom OpenAPI spec
     with open(os.path.join(os.path.dirname(__file__), "openapi.json"), "r") as f:
         spec = jsonify.load(f)
     return json(spec)
+
 
 def greeter():
     if os.path.exists("src/data/config.json"):
@@ -1244,7 +1460,7 @@ def greeter():
         if address:
             print(colored(f"Welcome back {data['address']}!", "green"))
         else:
-            print(colored("Invalid address in config.json :( ignoring", "red"))
+            print(colored("Invalid address in config.json :(", "red"))
     else:
         pass
 

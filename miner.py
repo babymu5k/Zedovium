@@ -5,6 +5,7 @@ import random
 import sys
 from datetime import datetime
 import json
+import signal
 
 
 # ANSI color codes
@@ -174,7 +175,6 @@ def mine(zedoguard_active):
     miner_address = config["address"]
     blocks_mined = 0  # Add counter for mined blocks
     blocks_mined = 0
-    last_speed_check = 0
     
     while True:
         try:
@@ -252,4 +252,7 @@ def mine(zedoguard_active):
 if __name__ == "__main__":
     clear_screen()
     zedoguard_active = CheckZedoGuard(get_node())
-    mine(zedoguard_active)
+    try:
+        mine(zedoguard_active)
+    except KeyboardInterrupt:
+        print(f"{COLORS['blue']} Ctrl-C Detected... Exiting gracefully... {COLORS['reset']}")
